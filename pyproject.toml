@@ -1,0 +1,21 @@
+[build-system]
+requires = [
+    "setuptools>=61",
+    "wheel",
+    "setuptools_scm>=6.2",
+    "pip>=21.2",
+]
+
+[project]
+name = "desiblind"
+authors = [{name = "Enrique Paillas"}]
+description = "Blinding for DESI galaxy clustering statistics"
+version = "0.0.0"
+dependencies = ["desilike"]
+readme = "README.md"
+requires-python = ">=3.10"
+urls = {Repository = "https://github.com/epaillas/desiblind"}
+classifiers = ["Programming Language :: Python :: 3"]
+
+[tool.setuptools]
+packages = ["desiblind"]
