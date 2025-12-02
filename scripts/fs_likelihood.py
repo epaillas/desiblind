@@ -1,3 +1,6 @@
+from pathlib import Path
+import numpy as np
+
 from desilike.theories.galaxy_clustering import DirectPowerSpectrumTemplate, REPTVelocileptorsTracerPowerSpectrumMultipoles
 from desilike.observables.galaxy_clustering import TracerPowerSpectrumMultipolesObservable
 from desilike.likelihoods import ObservablesGaussianLikelihood
@@ -9,23 +12,34 @@ from desilike import setup_logging
 
 import lsstypes as types
 
-from pathlib import Path
-import numpy as np
+
+output_dir = Path('/global/cfs/cdirs/desicollab/users/epaillas/code/desiblind/scripts/')
+emulator_dir = output_dir / 'emulators'
+#output_dir = Path('tests/')
 
 
-def get_tracer_label(tracer):
-    return tracer.split('_')[0].replace('+', 'plus')
+def get_tracer_zrange(name):
+    list_zrange = {'BGS_z0': ('BGS_BRIGHT-21.35', (0.1, 0.4)), 
+                   'LRG_z0': ('LRG', (0.4, 0.6)),
+                   'LRG_z1': ('LRG', (0.6, 0.8)),
+                   'LRG_z2': ('LRG', (0.8, 1.1)),
+                   'ELG_z1': ('ELG_LOPnotqso', (1.1, 1.6)),
+                   'QSO_z0': ('QSO', (0.8, 2.1))}
+    if name is None:
+        return list_zrange
+    return list_zrange[name]
 
-def get_synthetic_data(statistic='mesh2_spectrum_poles', tracer='LRG', zmin=0.4, zmax=0.6,
-    region='GCcomb', ells=[0, 2, 4], weights='default_fkp', kmin=0.0, kmax=0.3, rebin=5):
+
+def get_synthetic_data(statistic='mesh2_spectrum_poles', tracer='LRG', zrange=(0.4, 0.6),
+    region='GCcomb', ells=[0, 2, 4], weights='default_fkp', klim=(0., 0.3), rebin=5):
     """
     Synthetic data from Abacus-HF mocks for testing.
-    """
-    
+    """    
     dirname = Path('/global/cfs/projectdirs/desi/mocks/cai/mock-challenge-cutsky-dr2/unblinded_data/dr2-v2/')
 
+    zmin, zmax = zrange
     covariance = types.read(dirname / f'covariance_{statistic}_{tracer}_z{zmin}-{zmax}_{region}_{weights}.h5')
-    observable = covariance.observable.select(k=slice(0, None, rebin)).select(k=(kmin, kmax)).get(ells=ells)
+    observable = covariance.observable.select(k=slice(0, None, rebin)).select(k=klim).get(ells=ells)
 
     covariance = covariance.at.observable.match(observable)
 
@@ -36,43 +50,55 @@ def get_synthetic_data(statistic='mesh2_spectrum_poles', tracer='LRG', zmin=0.4,
     return observable, covariance, window
 
 
-def DESIFSLikelihood(tracers=None, cosmo=None, klim=(0.02, 0.2), solve='.auto'):
-    """Create DESI FS likelihood."""
+def get_theory(cosmo=None, z=1., tracer=None):
+    """Instance of desilike theory model"""
+    from desilike.theories.galaxy_clustering import FixedPowerSpectrumTemplate, DirectPowerSpectrumTemplate, REPTVelocileptorsTracerPowerSpectrumMultipoles
+    from desilike.theories import Cosmoprimo
 
     if cosmo is None:
         cosmo = DirectPowerSpectrumTemplate(fiducial='DESI').cosmo
-        cosmo.init.params['sigma8_m'] = {'derived': True, 'latex': '\sigma_8'}  # derive sigma_8
+        cosmo.init.params['sigma8_m'] = {'derived': True, 'latex': r'\sigma_8'}  # derive sigma_8
         cosmo.init.params['tau_reio'].update(fixed=True)
         cosmo.init.params['omega_b'].update(fixed=False, prior={'dist': 'norm', 'loc': 0.02218, 'scale': (3.025e-7)**0.5})
         cosmo.init.update(engine='class')
 
-    this_zrange = []
-    for tracer, iz, zrange in list_zrange:
-        tracer_label = get_tracer_label(tracer)
-        namespace = '{tracer}_z{iz}'.format(tracer=tracer_label, iz=iz)
-        if tracers is not None and namespace.lower() not in tracers: continue
-        this_zrange.append((tracer, iz, zrange, namespace))
+    template = DirectPowerSpectrumTemplate(z=z, fiducial='DESI', cosmo=cosmo)
+    theory = REPTVelocileptorsTracerPowerSpectrumMultipoles(template=template, tracer=tracer[:3].upper(), prior_basis='physical', freedom='max')
+    return theory
 
+
+def DESIFSLikelihood(tracers=None, cosmo=None, klim=(0.02, 0.2), solve='.auto'):
+    """Create DESI FS likelihood."""
+
+    if tracers is None:
+        tracers = list(get_tracer_zrange(Name))
+  
     observables = []
     likelihoods = []
+    if cosmo is None:
+        cosmo = DirectPowerSpectrumTemplate(fiducial='DESI').cosmo
+        cosmo.init.params['sigma8_m'] = {'derived': True, 'latex': r'\sigma_8'}  # derive sigma_8
+        cosmo.init.params['tau_reio'].update(fixed=True)
+        cosmo.init.params['omega_b'].update(fixed=False, prior={'dist': 'norm', 'loc': 0.02218, 'scale': (3.025e-7)**0.5})
+        cosmo.init.update(engine='class')
 
-    for tracer, iz, zrange, namespace in this_zrange:
+    for namespace in tracers:
+        tracer, zrange = get_tracer_zrange(namespace)
         print('Adding DESI FS likelihood for tracer {}, zrange {}, namespace {}'.format(tracer, zrange, namespace))
 
         data, covariance, window = get_synthetic_data(
             tracer=tracer,
-            zmin=zrange[0],
-            zmax=zrange[1],
+            zrange=zrange,
             region='GCcomb',
             ells=[0, 2, 4],
             weights='default_fkp',
-            kmin=0.0,
-            kmax=0.3,
+            klim=klim,
             rebin=5
         )
-
-        template = DirectPowerSpectrumTemplate(z=window.theory.get(ells=0).z, fiducial='DESI', cosmo=cosmo)
-        theory = REPTVelocileptorsTracerPowerSpectrumMultipoles(template=template, tracer=tracer_label, prior_basis='physical', freedom='max')
+        tracer_label = tracer.split('_')[0]
+        # To reproduce previous bug:
+        tracer_label = 'QSO'  # FIXME
+        theory = get_theory(cosmo=cosmo, z=window.theory.get(ells=0).z, tracer=tracer_label)
         observable = TracerPowerSpectrumMultipolesObservable(
             data=data,
             theory=theory,
@@ -81,7 +107,7 @@ def DESIFSLikelihood(tracers=None, cosmo=None, klim=(0.02, 0.2), solve='.auto'):
         )
 
         # Compute or swap in PT emulator
-        emu_fn = Path(f'emulator_fs_{namespace}.npy')
+        emu_fn = emulator_dir / f'emulator_fs_{namespace}.npy'
 
         if emu_fn.exists():
             calculator = EmulatedCalculator.load(emu_fn)
@@ -104,9 +130,9 @@ def DESIFSLikelihood(tracers=None, cosmo=None, klim=(0.02, 0.2), solve='.auto'):
         # Update namespace of bias parameters (to have one parameter per tracer / z-bin)
         for param in theory.init.params:
             # Update latex just to have better labels
+            iz = int(namespace.split('_')[-1][1:])
             param.update(namespace=namespace,
                          latex=param.latex(namespace=r'\mathrm{{{}}}, {:d}'.format(tracer_label, iz), inline=False))
-        
 
         likelihood = ObservablesGaussianLikelihood(observable, name=namespace)
         likelihoods.append(likelihood)
@@ -125,59 +151,52 @@ def DESIFSLikelihood(tracers=None, cosmo=None, klim=(0.02, 0.2), solve='.auto'):
 
     return likelihood
 
-def run_mcmc(likelihood):
-    save_dir = '/global/cfs/cdirs/desicollab/users/epaillas/code/desiblind/scripts/chains/'
-    save_fn = [Path(save_dir) / f'chain_abacushf_fs_{ichain:d}.npy' for ichain in range(4)]
+
+def get_fit_fn(kind='profiles'):
+    if kind == 'profiles':
+        save_dir = output_dir / 'profiles'
+        save_fn = Path(save_dir) / f'profiles_abacushf_fs.npy'
+    elif kind == 'chains':
+        save_dir = output_dir / 'chains'
+        save_fn = [Path(save_dir) / f'chain_abacushf_fs_{ichain:d}.npy' for ichain in range(4)]
+    return save_fn
+
+
+def run_sampler(likelihood):
+    save_fn = get_fit_fn('chains')
     sampler = EmceeSampler(likelihood, nwalkers=64, save_fn=save_fn, seed=42)
     chains = sampler.run(min_iterations=200, check={'max_eigen_gr': 0.03})
 
+
 def run_profiler(likelihood):
-    save_dir = '/global/cfs/cdirs/desicollab/users/epaillas/code/desiblind/scripts/profiles/'
-    save_fn = Path(save_dir) / f'profiles_abacushf_fs.npy'
+    save_fn = get_fit_fn('profiles')
     profiler = MinuitProfiler(likelihood, seed=42)
     profiles = profiler.maximize()
     print(profiles.to_stats(tablefmt='pretty'))
     profiles.save(save_fn)
+    return profiles
 
 
 if __name__ == '__main__':
 
+    todo = ['profile']
     setup_logging()
 
-
-    list_zrange = [
-        ('BGS_BRIGHT-21.35', 0, (0.1, 0.4)), 
-        ('LRG', 0, (0.4, 0.6)),
-        ('LRG', 1, (0.6, 0.8)),
-        ('LRG', 2, (0.8, 1.1)),
-        ('ELG_LOPnotqso', 1, (1.1, 1.6)),
-        ('QSO', 0, (0.8, 2.1)),
-        # ('Lya', 0, (1.8, 4.2))
-    ]
-
-    tracers = [
-        'bgs_z0',
-        'lrg_z0',
-        'lrg_z1',
-        'lrg_z2',
-        'elg_z1',
-        'qso_z0'
-    ]
-
-    klim = (0.02, 0.2)
-
+    tracers = ['BGS_z0', 'LRG_z0', 'LRG_z1', 'LRG_z2', 'ELG_z1', 'QSO_z0']
     likelihood = DESIFSLikelihood(
-        tracers=tracers,
-        cosmo=None,
-        klim=klim,
-        solve='.auto',
-    )
+            tracers=tracers,
+            cosmo=None,
+            klim=(0., 0.3),
+            solve='.auto',
+        )
 
-    # run_mcmc(likelihood)
-    run_profiler(likelihood)
+    if 'sample' in todo:
+        run_sampler(likelihood)
 
-    profiles = Profiles.load('profiles/profiles_abacushf_fs.npy')
-    likelihood(**profiles.bestfit.choice(index='argmax', input=True))
-    for tracer, likelihood in zip(tracers, likelihood.likelihoods):
-        observable = likelihood.observables[0]
-        observable.plot(fn=f'fig/plot_bestfit_{tracer}.png')
+    if 'profile' in todo:
+        #profiles = run_profiler(likelihood)
+        profiles = Profiles.load(get_fit_fn('profiles'))
+        likelihood(**profiles.bestfit.choice(index='argmax', input=True))
+        for tracer, likelihood in zip(tracers, likelihood.likelihoods):
+            observable = likelihood.observables[0]
+            observable.plot(fn=output_dir / 'fig' / f'plot_bestfit_{tracer}.png')
