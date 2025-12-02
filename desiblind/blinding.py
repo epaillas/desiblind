@@ -1,33 +1,41 @@
 from pathlib import Path
+import itertools
+
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.interpolate import InterpolatedUnivariateSpline
 
-from desilike.observables.galaxy_clustering import TracerPowerSpectrumMultipolesObservable
+try:
+    import lsstypes as types
+    from lsstypes import ObservableTree
+except ImportError:
+    ObservableTree = None
 
 from desiblind.utils import set_plot_style
 
 
 SHIFTS_DIR = '/global/cfs/cdirs/desicollab/users/epaillas/y3-growth/dump/'
-CHOSEN_BID = 0  # Change this to the desired blinded data ID
 
 
 class Observable:
     """
     Class to hold information about a galaxy clustering observable.
     """
-    def __init__(self, name, likelihood):
+    def __init__(self, name, data, covariance=None):
+        """
+        Parameters
+        ----------
+        name : str
+            Name of the observable.
+        data : ObservableTree
+            Reference data vector.
+        covariance : CovarianceMatrix
+            Covariance matrix.
+        """
         self.name = name
-        self.likelihood = likelihood
-
-        self.k = likelihood.observables[0].k[0]
-        self.data = likelihood.observables[0].data
-        self.covariance = likelihood.observables[0].covariance
-        self.ells = likelihood.observables[0].ells
-        self.theory = likelihood.observables[0].theory
-
+        self.covariance = covariance
+        self.reference_data = data
         self.blinded_data = []
-        self.delta_theory = []
         self.blinded_data_id = 0
         
 
@@ -35,6 +43,8 @@ class Blinder:
     """
     Class to handle blinding of galaxy clustering observables.
     """
+    blinded_nmax = 20
+
     def __init__(self):
         self.observables = []
 
@@ -47,13 +57,16 @@ class Blinder:
     #     pred = [pred.get(ell).value() for ell in theory.ells]
     #     return pred
 
-    def add_observable(self, name, likelihood, reference_params):
-        observable = Observable(name, likelihood)
-        observable.reference_params = reference_params
-        setattr(self, name, observable)
+    def add_observable(self, name, data, covariance=None):
+        observable = Observable(name, data, covariance=covariance)
         self.observables.append(observable)
 
-    def _apply_blinding(self, shifted_params: dict, name: str = None):
+    @classmethod
+    def __get_bid(cls):
+        rng = np.random.RandomState(seed=42)
+        return rng.randint(0, cls.blinded_nmax)
+
+    def set_blinded_data(self, name: str = None, blinded_data=None):
         """
         Method to apply the blinding to the data, only meant to be used
         by the developers implementing the blinding procedure. General users
@@ -62,43 +75,23 @@ class Blinder:
         for observable in self.observables:
             if name is not None and observable.name != name:
                 continue
-
-            # Compute reference theory
-            observable.likelihood(**observable.reference_params)
-            reference_theory = observable.likelihood.observables[0].theory
-            # reference_theory = observable.theory
-
-            # keep reference params that are not shifted
-            for param in observable.reference_params:
-                if param not in shifted_params:
-                    shifted_params[param] = observable.reference_params[param]
-
-            # Compute shifts
-            observable.likelihood(**shifted_params)
-            shifted_theory = observable.likelihood.observables[0].theory
-            # shifted_theory = observable.theory
-
-            # Apply blinding
-            delta_theory = []
-            blinded_data = []
-            unblinded_data = observable.likelihood.observables[0].data
-            for i, ell in enumerate(observable.ells):
-                delta_theory.append(shifted_theory[i] - reference_theory[i])
-                blinded_data.append(unblinded_data[i] + delta_theory[i])
+            if not isinstance(blinded_data, ObservableTree):
+                blinded_data = observable.reference_data.clone(value=np.ravel(blinded_data))
             observable.blinded_data.append(blinded_data)
-            observable.delta_theory.append(delta_theory)
 
-    def save_blinded_data(self, save_dir: Path | str = SHIFTS_DIR):
+    def write_blinded_shifts(self, save_dir: Path | str = SHIFTS_DIR):
         """
-        Saves the shifts applied during blinding (obtained with the
-        _apply_blinding function) to a file for later unblinding.
+        Saves the shifts applied during blinding (obtained with the set_blinded_data function) to a file for later unblinding.
         """
         cout = {}
         for observable in self.observables:
-            for bid, delta_theory in enumerate(observable.delta_theory):
-                shifts = []
-                for i, ell in enumerate(observable.ells):
-                    shifts.append(InterpolatedUnivariateSpline(observable.k, delta_theory[i], k=3))
+            assert len(observable.blinded_data) >= self.blinded_nmax, f'Please generate at least {self.blinded_nmax} blinded data vectors'
+            for bid, blinded_data in enumerate(observable.blinded_data):
+                shifts = {}
+                for ell in blinded_data.ells:
+                    k = blinded_data.get(ell).coords('k')
+                    diff = blinded_data.get(ell).value() - observable.reference_data.get(ell).value()
+                    shifts[ell] = (k, diff)
                 namespace = hash(f'{observable.name}_bid{bid}')
                 cout[namespace] = shifts
         save_fn = Path(save_dir) / 'shifts_blinding.npy'
@@ -109,53 +102,98 @@ class Blinder:
         cls,
         name: str,
         data: np.ndarray,
-        k: np.ndarray,
-        ells: list = [0, 2, 4]
+        **kwargs
     ) -> np.ndarray:
         """
         Apply blinding from a saved shifts file. This method can be used
         by general users to blind their data, without the need of instantiating
         the Blinder class.
+
+        Parameters
+        ----------
+        name : str
+            Name of the tracer - redshift bin, e.g. 'LRG_z0'.
+        data : list, ObservableTree
+            If list, list of multipoles; in this case also provide corresponding ``ells`` and ``k``.
+            Else, an ObservableTree from lsstypes.
+
+        Returns
+        -------
+        blinded_data : np.ndarray or ObservableTree
         """
         save_fn = Path(SHIFTS_DIR) / 'shifts_blinding.npy'
         shifts_dict = np.load(save_fn, allow_pickle=True).item()
-        key = hash(f'{name}_bid{CHOSEN_BID}')
+        key = hash(f'{name}_bid{cls.__get_bid()}')
+        if key not in shifts_dict:
+            raise ValueError(f'Cannot find the blinding value for {name}')
         shifts = shifts_dict[key]
 
-        blinded_data = []
-        for i, ell in enumerate(ells):
-            shift_fn = shifts[i]
-            shift_values = shift_fn(k)
-            blinded_data.append(data[i] + shift_values)
-        return np.array(blinded_data)
+        def get_blinded_data(k, ells, data):
+            blinded_data = []
+            for ill, ell in enumerate(ells):
+                shift_values = InterpolatedUnivariateSpline(shifts[ell][0], shifts[ell][1], k=3)(k[ill])
+                blinded_data.append(data[ill] + shift_values)
+            return blinded_data
+        
+        if isinstance(data, ObservableTree):
+            blinded_data = get_blinded_data([pole.coords('k') for pole in data], data.ells, [pole.value() for pole in data])
+            return data.clone(value=np.ravel(blinded_data))
+        else:
+            k, ells = kwargs['k'], kwargs['ells']
+            blinded_data = get_blinded_data([k] * len(ells), ells, data)
+            return np.array(blinded_data)
 
     @classmethod
     def remove_blinding(
         cls,
         name: str,
         data: np.ndarray,
-        k: np.ndarray,
-        ells: list = [0, 2, 4]
+        **kwargs,
     ) -> np.ndarray:
         """
         Remove blinding from a saved shifts file. This method can be used
-        by general users to unblind their data, without the need of instantiating
+        by general users to blind their data, without the need of instantiating
         the Blinder class.
+
+        Parameters
+        ----------
+        name : str
+            Name of the tracer - redshift bin, e.g. 'LRG_z0'.
+        data : list, ObservableTree
+            If list, list of multipoles; in this case also provide corresponding ``ells`` and ``k``.
+            Else, an ObservableTree from lsstypes.
+
+        Returns
+        -------
+        unblinded_data : np.ndarray or ObservableTree
         """
+        if not kwargs.get('force', False):
+            raise ValueError('Are you sure you want to unblind? If so, provide "force=True"')
         save_fn = Path(SHIFTS_DIR) / 'shifts_blinding.npy'
         shifts_dict = np.load(save_fn, allow_pickle=True).item()
-        key = hash(f'{name}_bid{CHOSEN_BID}')
+        key = hash(f'{name}_bid{cls.__get_bid()}')
+        if key not in shifts_dict:
+            raise ValueError(f'Cannot find the blinding value for {name}')
         shifts = shifts_dict[key]
 
-        unblinded_data = []
-        for i, ell in enumerate(ells):
-            shift_fn = shifts[i]
-            shift_values = shift_fn(k)
-            unblinded_data.append(data[i] - shift_values)
-        return np.array(unblinded_data)
+        def get_unblinded_data(k, data):
+            unblinded_data = []
+            for ill, ell in enumerate(ells):
+                shift_values = InterpolatedUnivariateSpline(shifts[ell][0], shifts[ell][1], k=3)(k[ill])
+                unblinded_data.append(data[ill] - shift_values)
+            return unblinded_data
+        
+        if isinstance(data, ObservableTree):
+            unblinded_data = get_unblinded_data([pole.coords('k') for pole in data], [pole.value() for pole in data])
+            return data.clone(value=np.ravel(unblinded_data))
+        else:
+            k, ells = kwargs['k'], kwargs['ells']
+            unblinded_data = get_unblinded_data([k] * len(ells), data)
+            return np.array(unblinded_data)
 
 
 class TracerPowerSpectrumMultipolesBlinder(Blinder):
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
@@ -167,10 +205,6 @@ class TracerPowerSpectrumMultipolesBlinder(Blinder):
         the reference theory and (multiple) blinded data vectors.
         """
         # TODO use KP3 color scheme
-
-        import matplotlib.pyplot as plt
-        import itertools
-
         fig, ax = plt.subplots(figsize=(5, 4))
         markers = itertools.cycle(('o', 'x', '+', 's'))
         linestyles = itertools.cycle(('--', ':', '-.'))
@@ -178,30 +212,23 @@ class TracerPowerSpectrumMultipolesBlinder(Blinder):
         for observable in self.observables:
             if name is not None and observable.name != name:
                 continue
-            k = observable.k
-            data = observable.data
-            error = np.sqrt(np.diag(observable.covariance))
-
-            if show_reference:
-                observable.likelihood(**observable.reference_params)
-                reference_theory = observable.likelihood.observables[0].theory
+            reference_data = observable.reference_data
 
             if show_blinded:
                 for ibid, bid in enumerate(blinded_ids):
                     blinded_data = observable.blinded_data[bid]
-                    for iell, ell in enumerate(observable.ells):
-                        ax.plot(k, k * blinded_data[iell], ls='--', color=f'C{iell}', lw=1.0,
-                            label=f'blinded data' if iell == 0  and ibid == 0 else None)
+                    for ill, ell in enumerate(blinded_data.ells):
+                        pole = blinded_data.get(ells=ell)
+                        ax.plot(k:=pole.coords('k'), k * pole.value(), ls='--', color=f'C{ill}', lw=1.0,
+                            label=f'blinded data' if ill == 0 and ibid == 0 else None)
 
             marker = next(markers)
-
-            for i, ell in enumerate(observable.ells):
-                ax.errorbar(k, k * data[i], yerr=k * error[i * len(k):(i + 1) * len(k)], color=f'C{i}',
-                label=observable.name if i == 0 else None, marker=marker, ms=2.5, ls='none', elinewidth=1.0)
-
-                if show_reference:
-                    ax.plot(k, k * reference_theory[i], ls='-', color=f'C{i}', lw=1.0,
-                        label=f'reference theory' if i == 0 else None)
+            if show_reference:
+                for ill, ell in enumerate(reference_data.ells):
+                    std = observable.covariance.at.observable.get(ells=ell).std()
+                    pole = reference_data.get(ells=ell)
+                    ax.errorbar(k:=pole.coords('k'), k * pole.value(), yerr=k * std, color=f'C{ill}',
+                    label=observable.name if ill == 0 else None, marker=marker, ms=2.5, ls='none', elinewidth=1.0)
 
         ax.legend()
         ax.set_xlabel(r'$k\,[h{\rm Mpc}^{-1}]$', fontsize=14)
@@ -211,5 +238,6 @@ class TracerPowerSpectrumMultipolesBlinder(Blinder):
 
 
 class TracerBispectrumMultipolesBlinder(Blinder):
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
