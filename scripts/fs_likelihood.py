@@ -4,6 +4,7 @@ from desilike.likelihoods import ObservablesGaussianLikelihood
 from desilike.emulators import EmulatedCalculator
 from desilike.samplers import EmceeSampler
 from desilike.profilers import MinuitProfiler
+from desilike.samples import Profiles
 from desilike import setup_logging
 
 import lsstypes as types
@@ -26,18 +27,13 @@ def get_synthetic_data(statistic='mesh2_spectrum_poles', tracer='LRG', zmin=0.4,
     covariance = types.read(dirname / f'covariance_{statistic}_{tracer}_z{zmin}-{zmax}_{region}_{weights}.h5')
     observable = covariance.observable.select(k=slice(0, None, rebin)).select(k=(kmin, kmax)).get(ells=ells)
 
-    poles = [observable.get(ell) for ell in ells]
-    k = poles[0].coords('k')
-    poles = [pole.value() for pole in poles]
-
     covariance = covariance.at.observable.match(observable)
-    covariance = covariance.value()
 
     window = types.read(dirname / f'window_{statistic}_{tracer}_z{zmin}-{zmax}_{region}_{weights}.h5')
     window = window.at.observable.match(observable)
     window = window.at.theory.select(k=(0, 0.35))
 
-    return k, poles, covariance, window
+    return observable, covariance, window
 
 
 def DESIFSLikelihood(tracers=None, cosmo=None, klim=(0.02, 0.2), solve='.auto'):
@@ -63,7 +59,7 @@ def DESIFSLikelihood(tracers=None, cosmo=None, klim=(0.02, 0.2), solve='.auto'):
     for tracer, iz, zrange, namespace in this_zrange:
         print('Adding DESI FS likelihood for tracer {}, zrange {}, namespace {}'.format(tracer, zrange, namespace))
 
-        k, data, covariance, window = get_synthetic_data(
+        data, covariance, window = get_synthetic_data(
             tracer=tracer,
             zmin=zrange[0],
             zmax=zrange[1],
@@ -76,16 +72,12 @@ def DESIFSLikelihood(tracers=None, cosmo=None, klim=(0.02, 0.2), solve='.auto'):
         )
 
         template = DirectPowerSpectrumTemplate(z=window.theory.get(ells=0).z, fiducial='DESI', cosmo=cosmo)
-        theory = REPTVelocileptorsTracerPowerSpectrumMultipoles(template=template, prior_basis='physical', freedom='max', tracer=tracer_label)
+        theory = REPTVelocileptorsTracerPowerSpectrumMultipoles(template=template, tracer=tracer_label, prior_basis='physical', freedom='max')
         observable = TracerPowerSpectrumMultipolesObservable(
-            data=np.concatenate(data),
+            data=data,
             theory=theory,
             covariance=covariance,
-            wmatrix=window.value(),
-            k=k,
-            kin=window.theory.get(ells=0).coords('k'),
-            ells=[0, 2, 4],
-            ellsin=window.theory.ells
+            wmatrix=window,
         )
 
         # Compute or swap in PT emulator
@@ -134,14 +126,18 @@ def DESIFSLikelihood(tracers=None, cosmo=None, klim=(0.02, 0.2), solve='.auto'):
     return likelihood
 
 def run_mcmc(likelihood):
-    sampler = EmceeSampler(likelihood, nwalkers=64, save_fn='chain_fs_nov30_2.npy', seed=42)
-    chains = sampler.run(min_iterations=200, check={'max_eigen_gr': 0.03}, thin_by=10)
+    save_dir = '/global/cfs/cdirs/desicollab/users/epaillas/code/desiblind/scripts/chains/'
+    save_fn = [Path(save_dir) / f'chain_abacushf_fs_{ichain:d}.npy' for ichain in range(4)]
+    sampler = EmceeSampler(likelihood, nwalkers=64, save_fn=save_fn, seed=42)
+    chains = sampler.run(min_iterations=200, check={'max_eigen_gr': 0.03})
 
 def run_profiler(likelihood):
-
+    save_dir = '/global/cfs/cdirs/desicollab/users/epaillas/code/desiblind/scripts/profiles/'
+    save_fn = Path(save_dir) / f'profiles_abacushf_fs.npy'
     profiler = MinuitProfiler(likelihood, seed=42)
     profiles = profiler.maximize()
-    profiles.save('profiles_fs.npy')
+    print(profiles.to_stats(tablefmt='pretty'))
+    profiles.save(save_fn)
 
 
 if __name__ == '__main__':
@@ -168,7 +164,7 @@ if __name__ == '__main__':
         'qso_z0'
     ]
 
-    klim = (0.02, 0.3)
+    klim = (0.02, 0.2)
 
     likelihood = DESIFSLikelihood(
         tracers=tracers,
@@ -177,5 +173,11 @@ if __name__ == '__main__':
         solve='.auto',
     )
 
-    run_mcmc(likelihood)
-    # run_profiler(likelihood)
+    # run_mcmc(likelihood)
+    run_profiler(likelihood)
+
+    profiles = Profiles.load('profiles/profiles_abacushf_fs.npy')
+    likelihood(**profiles.bestfit.choice(index='argmax', input=True))
+    for tracer, likelihood in zip(tracers, likelihood.likelihoods):
+        observable = likelihood.observables[0]
+        observable.plot(fn=f'fig/plot_bestfit_{tracer}.png')

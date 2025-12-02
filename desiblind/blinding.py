@@ -16,20 +16,15 @@ class Observable:
     """
     Class to hold information about a galaxy clustering observable.
     """
-    def __init__(self, name, k, data, theory, covariance, window,
-        reference_params: dict = None, ells: list = None):
+    def __init__(self, name, likelihood):
         self.name = name
-        self.k = k
-        self.data = data
-        self.theory = theory
-        self.covariance = covariance
-        self.window = window
-        self.reference_params = reference_params
+        self.likelihood = likelihood
 
-        if ells is not None:
-            self.ells = ells
-        else:
-            self.ells = theory.ells
+        self.k = likelihood.observables[0].k[0]
+        self.data = likelihood.observables[0].data
+        self.covariance = likelihood.observables[0].covariance
+        self.ells = likelihood.observables[0].ells
+        self.theory = likelihood.observables[0].theory
 
         self.blinded_data = []
         self.delta_theory = []
@@ -43,19 +38,17 @@ class Blinder:
     def __init__(self):
         self.observables = []
 
-    def get_convolved_theory(self, theory, window, params={}):
-        """
-        Convolve the theory evaluated at given params with the window function.
-        """
-        pred = theory(params)
-        pred = window.dot(np.ravel(pred), return_type=None, zpt=False)
-        pred = [pred.get(ell).value() for ell in theory.ells]
-        return pred
+    # def get_convolved_theory(self, theory, window, params={}):
+    #     """
+    #     Convolve the theory evaluated at given params with the window function.
+    #     """
+    #     pred = theory(params)
+    #     pred = window.dot(np.ravel(pred), return_type=None, zpt=False)
+    #     pred = [pred.get(ell).value() for ell in theory.ells]
+    #     return pred
 
-    def add_observable(self, name, k, data, theory, covariance, window,
-        reference_params: dict = None):
-        observable = Observable(name, k, data, theory, covariance, window,
-            reference_params=reference_params)
+    def add_observable(self, name, likelihood, reference_params):
+        observable = Observable(name, likelihood)
         observable.reference_params = reference_params
         setattr(self, name, observable)
         self.observables.append(observable)
@@ -71,11 +64,9 @@ class Blinder:
                 continue
 
             # Compute reference theory
-            reference_theory = self.get_convolved_theory(
-                observable.theory,
-                observable.window,
-                params=observable.reference_params
-            )
+            observable.likelihood(**observable.reference_params)
+            reference_theory = observable.likelihood.observables[0].theory
+            # reference_theory = observable.theory
 
             # keep reference params that are not shifted
             for param in observable.reference_params:
@@ -83,18 +74,17 @@ class Blinder:
                     shifted_params[param] = observable.reference_params[param]
 
             # Compute shifts
-            shifted_theory = self.get_convolved_theory(
-                observable.theory,
-                observable.window,
-                params=shifted_params
-            )
+            observable.likelihood(**shifted_params)
+            shifted_theory = observable.likelihood.observables[0].theory
+            # shifted_theory = observable.theory
 
             # Apply blinding
             delta_theory = []
             blinded_data = []
+            unblinded_data = observable.likelihood.observables[0].data
             for i, ell in enumerate(observable.ells):
                 delta_theory.append(shifted_theory[i] - reference_theory[i])
-                blinded_data.append(observable.data[i] + delta_theory[i])
+                blinded_data.append(unblinded_data[i] + delta_theory[i])
             observable.blinded_data.append(blinded_data)
             observable.delta_theory.append(delta_theory)
 
@@ -193,11 +183,8 @@ class TracerPowerSpectrumMultipolesBlinder(Blinder):
             error = np.sqrt(np.diag(observable.covariance))
 
             if show_reference:
-                theory = self.get_convolved_theory(
-                    observable.theory,
-                    observable.window,
-                    params=observable.reference_params
-                )
+                observable.likelihood(**observable.reference_params)
+                reference_theory = observable.likelihood.observables[0].theory
 
             if show_blinded:
                 for ibid, bid in enumerate(blinded_ids):
@@ -213,7 +200,7 @@ class TracerPowerSpectrumMultipolesBlinder(Blinder):
                 label=observable.name if i == 0 else None, marker=marker, ms=2.5, ls='none', elinewidth=1.0)
 
                 if show_reference:
-                    ax.plot(k, k * theory[i], ls='-', color=f'C{i}', lw=1.0,
+                    ax.plot(k, k * reference_theory[i], ls='-', color=f'C{i}', lw=1.0,
                         label=f'reference theory' if i == 0 else None)
 
         ax.legend()
