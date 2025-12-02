@@ -14,7 +14,7 @@ import lsstypes as types
 
 
 output_dir = Path('/global/cfs/cdirs/desicollab/users/epaillas/code/desiblind/scripts/')
-emulator_dir = output_dir / 'emulators'
+emulator_dir = output_dir / 'emulators/enrique'
 #output_dir = Path('tests/')
 
 
@@ -97,7 +97,7 @@ def DESIFSLikelihood(tracers=None, cosmo=None, klim=(0.02, 0.2), solve='.auto'):
         )
         tracer_label = tracer.split('_')[0]
         # To reproduce previous bug:
-        tracer_label = 'QSO'  # FIXME
+        # tracer_label = 'QSO'  # FIXME
         theory = get_theory(cosmo=cosmo, z=window.theory.get(ells=0).z, tracer=tracer_label)
         observable = TracerPowerSpectrumMultipolesObservable(
             data=data,
@@ -179,14 +179,14 @@ def run_profiler(likelihood):
 
 if __name__ == '__main__':
 
-    todo = ['profile']
+    todo = ['sample']
     setup_logging()
 
     tracers = ['BGS_z0', 'LRG_z0', 'LRG_z1', 'LRG_z2', 'ELG_z1', 'QSO_z0']
     likelihood = DESIFSLikelihood(
             tracers=tracers,
             cosmo=None,
-            klim=(0., 0.3),
+            klim=(0., 0.2),
             solve='.auto',
         )
 
@@ -194,7 +194,7 @@ if __name__ == '__main__':
         run_sampler(likelihood)
 
     if 'profile' in todo:
-        #profiles = run_profiler(likelihood)
+        profiles = run_profiler(likelihood)
         profiles = Profiles.load(get_fit_fn('profiles'))
         likelihood(**profiles.bestfit.choice(index='argmax', input=True))
         for tracer, likelihood in zip(tracers, likelihood.likelihoods):
