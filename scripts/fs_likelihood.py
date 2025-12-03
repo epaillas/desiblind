@@ -1,11 +1,12 @@
 from pathlib import Path
 import numpy as np
+import argparse
 
 from desilike.theories.galaxy_clustering import DirectPowerSpectrumTemplate, REPTVelocileptorsTracerPowerSpectrumMultipoles
 from desilike.observables.galaxy_clustering import TracerPowerSpectrumMultipolesObservable
 from desilike.likelihoods import ObservablesGaussianLikelihood
 from desilike.emulators import EmulatedCalculator
-from desilike.samplers import EmceeSampler
+from desilike.samplers import EmceeSampler, MCMCSampler
 from desilike.profilers import MinuitProfiler
 from desilike.samples import Profiles
 from desilike import setup_logging
@@ -14,7 +15,7 @@ import lsstypes as types
 
 
 output_dir = Path('/global/cfs/cdirs/desicollab/users/epaillas/code/desiblind/scripts/')
-emulator_dir = output_dir / 'emulators/enrique'
+emulator_dir = output_dir / 'emulators/ns/'
 #output_dir = Path('tests/')
 
 
@@ -60,6 +61,7 @@ def get_theory(cosmo=None, z=1., tracer=None):
         cosmo.init.params['sigma8_m'] = {'derived': True, 'latex': r'\sigma_8'}  # derive sigma_8
         cosmo.init.params['tau_reio'].update(fixed=True)
         cosmo.init.params['omega_b'].update(fixed=False, prior={'dist': 'norm', 'loc': 0.02218, 'scale': (3.025e-7)**0.5})
+        cosmo.init.params['n_s'].update(fixed=False, prior={'dist': 'norm', 'loc': 0.9649, 'scale': 0.042})
         cosmo.init.update(engine='class')
 
     template = DirectPowerSpectrumTemplate(z=z, fiducial='DESI', cosmo=cosmo)
@@ -80,6 +82,7 @@ def DESIFSLikelihood(tracers=None, cosmo=None, klim=(0.02, 0.2), solve='.auto'):
         cosmo.init.params['sigma8_m'] = {'derived': True, 'latex': r'\sigma_8'}  # derive sigma_8
         cosmo.init.params['tau_reio'].update(fixed=True)
         cosmo.init.params['omega_b'].update(fixed=False, prior={'dist': 'norm', 'loc': 0.02218, 'scale': (3.025e-7)**0.5})
+        cosmo.init.params['n_s'].update(fixed=False, prior={'dist': 'norm', 'loc': 0.9649, 'scale': 0.042})
         cosmo.init.update(engine='class')
 
     for namespace in tracers:
@@ -152,19 +155,23 @@ def DESIFSLikelihood(tracers=None, cosmo=None, klim=(0.02, 0.2), solve='.auto'):
     return likelihood
 
 
-def get_fit_fn(kind='profiles'):
+def get_fit_fn(kind='profiles', sampler_name='emcee'):
     if kind == 'profiles':
-        save_dir = output_dir / 'profiles'
-        save_fn = Path(save_dir) / f'profiles_abacushf_fs.npy'
+        save_dir = Path(output_dir) / 'profiles/solve-best-ns-kmax0.3'
+        save_fn = save_dir / f'profiles_abacushf_fs.npy'
     elif kind == 'chains':
-        save_dir = output_dir / 'chains'
-        save_fn = [Path(save_dir) / f'chain_abacushf_fs_{ichain:d}.npy' for ichain in range(4)]
+        save_dir = Path(output_dir) / f'chains/solve-best-ns-kmax0.3/{sampler_name}'
+        save_fn = [save_dir / f'chain_abacushf_fs_{ichain:d}.npy' for ichain in range(4)]
     return save_fn
 
 
-def run_sampler(likelihood):
-    save_fn = get_fit_fn('chains')
-    sampler = EmceeSampler(likelihood, nwalkers=64, save_fn=save_fn, seed=42)
+def run_sampler(likelihood, sampler_name='emcee'):
+    save_fn = get_fit_fn('chains', sampler_name=sampler_name)
+    chain_fn = None
+    if sampler_name == 'emcee':
+        sampler = EmceeSampler(likelihood, chain_fn=chain_fn, nwalkers=64, save_fn=save_fn, seed=42)
+    elif sampler_name == 'mcmc':
+        sampler = MCMCSampler(likelihood, chains=chain_fn, save_fn=save_fn, oversample_power=0., seed=42)
     chains = sampler.run(min_iterations=200, check={'max_eigen_gr': 0.03})
 
 
@@ -179,19 +186,25 @@ def run_profiler(likelihood):
 
 if __name__ == '__main__':
 
-    todo = ['sample']
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--todo", type=str, nargs='+', default=['profile', 'sample'],)
+    parser.add_argument("--sampler", type=str, default='emcee',)
+
+    args = parser.parse_args()
+
+    todo = args.todo
     setup_logging()
 
     tracers = ['BGS_z0', 'LRG_z0', 'LRG_z1', 'LRG_z2', 'ELG_z1', 'QSO_z0']
     likelihood = DESIFSLikelihood(
             tracers=tracers,
             cosmo=None,
-            klim=(0., 0.2),
-            solve='.auto',
+            klim=(0., 0.3),
+            solve='.best',
         )
 
     if 'sample' in todo:
-        run_sampler(likelihood)
+        run_sampler(likelihood, sampler_name=args.sampler)
 
     if 'profile' in todo:
         profiles = run_profiler(likelihood)

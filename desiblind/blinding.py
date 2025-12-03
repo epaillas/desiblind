@@ -1,5 +1,6 @@
 from pathlib import Path
 import itertools
+import hashlib
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -36,14 +37,13 @@ class Observable:
         self.covariance = covariance
         self.reference_data = data
         self.blinded_data = []
-        self.blinded_data_id = 0
         
 
 class Blinder:
     """
     Class to handle blinding of galaxy clustering observables.
     """
-    blinded_nmax = 20
+    blinded_nmax = 100
 
     def __init__(self):
         self.observables = []
@@ -92,7 +92,7 @@ class Blinder:
                     k = blinded_data.get(ell).coords('k')
                     diff = blinded_data.get(ell).value() - observable.reference_data.get(ell).value()
                     shifts[ell] = (k, diff)
-                namespace = hash(f'{observable.name}_bid{bid}')
+                namespace = hashlib.sha256(f'{observable.name}_bid{bid}'.encode()).hexdigest()
                 cout[namespace] = shifts
         save_fn = Path(save_dir) / 'shifts_blinding.npy'
         np.save(save_fn, cout)
@@ -123,7 +123,7 @@ class Blinder:
         """
         save_fn = Path(SHIFTS_DIR) / 'shifts_blinding.npy'
         shifts_dict = np.load(save_fn, allow_pickle=True).item()
-        key = hash(f'{name}_bid{cls.__get_bid()}')
+        key = hashlib.sha256(f'{name}_bid{cls.__get_bid()}'.encode()).hexdigest()
         if key not in shifts_dict:
             raise ValueError(f'Cannot find the blinding value for {name}')
         shifts = shifts_dict[key]
@@ -171,7 +171,7 @@ class Blinder:
             raise ValueError('Are you sure you want to unblind? If so, provide "force=True"')
         save_fn = Path(SHIFTS_DIR) / 'shifts_blinding.npy'
         shifts_dict = np.load(save_fn, allow_pickle=True).item()
-        key = hash(f'{name}_bid{cls.__get_bid()}')
+        key = hashlib.sha256(f'{name}_bid{cls.__get_bid()}'.encode()).hexdigest()
         if key not in shifts_dict:
             raise ValueError(f'Cannot find the blinding value for {name}')
         shifts = shifts_dict[key]
@@ -220,7 +220,7 @@ class TracerPowerSpectrumMultipolesBlinder(Blinder):
                     for ill, ell in enumerate(blinded_data.ells):
                         pole = blinded_data.get(ells=ell)
                         ax.plot(k:=pole.coords('k'), k * pole.value(), ls='--', color=f'C{ill}', lw=1.0,
-                            label=f'blinded data' if ill == 0 and ibid == 0 else None)
+                            label=f'blinded data' if ill == 0 and ibid == 0 else None, zorder=1)
 
             marker = next(markers)
             if show_reference:
@@ -228,7 +228,8 @@ class TracerPowerSpectrumMultipolesBlinder(Blinder):
                     std = observable.covariance.at.observable.get(ells=ell).std()
                     pole = reference_data.get(ells=ell)
                     ax.errorbar(k:=pole.coords('k'), k * pole.value(), yerr=k * std, color=f'C{ill}',
-                    label=observable.name if ill == 0 else None, marker=marker, ms=2.5, ls='none', elinewidth=1.0)
+                    label=observable.name if ill == 0 else None, marker=marker, ms=2.5, ls='none', elinewidth=1.0,
+                    zorder=2, mfc='k', mew=0.5)
 
         ax.legend()
         ax.set_xlabel(r'$k\,[h{\rm Mpc}^{-1}]$', fontsize=14)
