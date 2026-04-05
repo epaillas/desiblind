@@ -1,7 +1,10 @@
 """Standalone power-spectrum blinding workflow.
 
 This script is a scriptified version of ``nb/blinding_example.ipynb``. It keeps
-the same scientific flow while moving the notebook narrative into runnable code:
+the same scientific flow while moving the notebook narrative into runnable code.
+The perturbation theory backend can be selected with the same model names used
+in desi-clustering, with ``reptvelocileptors`` as the default and ``folpsD``
+available as an alternative.
 
 1. Load the best-fit full-shape parameters used as the reference cosmology.
 2. Build reference observables for each tracer and compare them to the input
@@ -63,6 +66,9 @@ def parse_args():
                         help='Number of blinded realizations to generate per tracer.')
     parser.add_argument('--sampler', default='mcmc',
                         help='Sampler subdirectory used by fs_likelihood.get_fit_fn.')
+    parser.add_argument('--theory-model', default='reptvelocileptors',
+                        choices=['reptvelocileptors', 'folpsD'],
+                        help='Theory backend used to build the blinded observables.')
     parser.add_argument('--chain-slice', nargs=2, type=int, default=(1, 4), metavar=('START', 'STOP'),
                         help='Slice of chain files to concatenate, matching notebook defaults.')
     parser.add_argument('--seed', type=int, default=42,
@@ -101,7 +107,7 @@ def load_chain(sampler_name, chain_slice):
     return Chain.concatenate([Chain.load(fn).ravel()[::1] for fn in chain_fns])
 
 
-def build_tracer_observable(namespace, cosmo_params, nuisance_params, ells, klim, rebin):
+def build_tracer_observable(namespace, cosmo_params, nuisance_params, ells, klim, rebin, theory_model):
     """Build the reference observable for one tracer."""
     tracer, zrange = get_tracer_zrange(namespace)
     data, covariance, window = get_synthetic_data(
@@ -113,7 +119,7 @@ def build_tracer_observable(namespace, cosmo_params, nuisance_params, ells, klim
         klim=tuple(klim),
         rebin=rebin,
     )
-    theory = get_theory(z=window.theory.get(ells=0).z, tracer=tracer)
+    theory = get_theory(z=window.theory.get(ells=0).z, tracer=tracer, theory_model=theory_model)
     theory.init.update(
         k=window.theory.get(ells=0).coords('k'),
         shotnoise=data.get(ells=0).values('shotnoise').mean(),
@@ -161,7 +167,7 @@ def get_blinding_samples(bestfit, chain, num_samples, seed):
     ]
 
 
-def add_reference_observables(blinder, tracers, cosmo_params, nuisance_params, ells, klim, rebin, plot_dir):
+def add_reference_observables(blinder, tracers, cosmo_params, nuisance_params, ells, klim, rebin, plot_dir, theory_model):
     """Build and register one reference observable per tracer."""
     for namespace in tracers:
         data, covariance, _, _, observable = build_tracer_observable(
@@ -171,12 +177,13 @@ def add_reference_observables(blinder, tracers, cosmo_params, nuisance_params, e
             ells=ells,
             klim=klim,
             rebin=rebin,
+            theory_model=theory_model,
         )
         save_reference_plot(namespace, observable, data, covariance, plot_dir)
         blinder.add_observable(name=namespace, data=observable, covariance=covariance)
 
 
-def generate_blinded_realizations(blinder, tracers, samples, ells, klim, rebin):
+def generate_blinded_realizations(blinder, tracers, samples, ells, klim, rebin, theory_model):
     """Generate blinded observables by re-evaluating theory at shifted parameters."""
     for namespace in tracers:
         tracer, zrange = get_tracer_zrange(namespace)
@@ -189,7 +196,7 @@ def generate_blinded_realizations(blinder, tracers, samples, ells, klim, rebin):
             klim=tuple(klim),
             rebin=rebin,
         )
-        theory = get_theory(z=window.theory.get(ells=0).z, tracer=tracer)
+        theory = get_theory(z=window.theory.get(ells=0).z, tracer=tracer, theory_model=theory_model)
         theory.init.update(
             k=window.theory.get(ells=0).coords('k'),
             shotnoise=data.get(ells=0).values('shotnoise').mean(),
@@ -289,6 +296,7 @@ def main():
         klim=args.klim,
         rebin=args.rebin,
         plot_dir=args.plot_dir,
+        theory_model=args.theory_model,
     )
 
     chain = load_chain(args.sampler, args.chain_slice)
@@ -300,6 +308,7 @@ def main():
         ells=args.ells,
         klim=args.klim,
         rebin=args.rebin,
+        theory_model=args.theory_model,
     )
     save_blinded_plots(blinder, args.tracers, args.plot_dir, args.num_samples)
 

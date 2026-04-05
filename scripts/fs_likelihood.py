@@ -2,7 +2,7 @@ from pathlib import Path
 import numpy as np
 import argparse
 
-from desilike.theories.galaxy_clustering import DirectPowerSpectrumTemplate, REPTVelocileptorsTracerPowerSpectrumMultipoles
+from desilike.theories.galaxy_clustering import DirectPowerSpectrumTemplate
 from desilike.observables.galaxy_clustering import TracerPowerSpectrumMultipolesObservable
 from desilike.likelihoods import ObservablesGaussianLikelihood
 from desilike.emulators import EmulatedCalculator
@@ -51,9 +51,20 @@ def get_synthetic_data(statistic='mesh2_spectrum_poles', tracer='LRG', zrange=(0
     return observable, covariance, window
 
 
-def get_theory(cosmo=None, z=1., tracer=None):
-    """Instance of desilike theory model"""
-    from desilike.theories.galaxy_clustering import FixedPowerSpectrumTemplate, DirectPowerSpectrumTemplate, REPTVelocileptorsTracerPowerSpectrumMultipoles
+def get_theory(cosmo=None, z=1., tracer=None, theory_model='reptvelocileptors'):
+    """Return a DESI full-shape theory model.
+
+    Parameters
+    ----------
+    theory_model : str, default='reptvelocileptors'
+        Perturbation theory backend. Supported values match desi-clustering:
+        ``'reptvelocileptors'`` and ``'folpsD'``.
+    """
+    from desilike.theories.galaxy_clustering import (
+        DirectPowerSpectrumTemplate,
+        FOLPSv2TracerPowerSpectrumMultipoles,
+        REPTVelocileptorsTracerPowerSpectrumMultipoles,
+    )
     from desilike.theories import Cosmoprimo
 
     if cosmo is None:
@@ -65,7 +76,25 @@ def get_theory(cosmo=None, z=1., tracer=None):
         cosmo.init.update(engine='class')
 
     template = DirectPowerSpectrumTemplate(z=z, fiducial='DESI', cosmo=cosmo)
-    theory = REPTVelocileptorsTracerPowerSpectrumMultipoles(template=template, tracer=tracer[:3].upper(), prior_basis='physical', freedom='max')
+    tracer_label = tracer[:3].upper()
+    if theory_model == 'reptvelocileptors':
+        theory = REPTVelocileptorsTracerPowerSpectrumMultipoles(
+            template=template,
+            tracer=tracer_label,
+            prior_basis='physical',
+            freedom='max',
+        )
+    elif theory_model == 'folpsD':
+        theory = FOLPSv2TracerPowerSpectrumMultipoles(
+            template=template,
+            tracer=tracer_label,
+            damping='lor',
+            prior_basis='physical_aap',
+            b3_coev=True,
+            A_full=False,
+        )
+    else:
+        raise ValueError(f'Unsupported theory model {theory_model!r}')
     return theory
 
 
