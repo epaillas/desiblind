@@ -33,12 +33,21 @@ from desilike.samples import Chain, Profiles
 
 from desiblind import TracerPowerSpectrumMultipolesBlinder
 
-from fs_likelihood import get_fit_fn, get_synthetic_data, get_theory, get_tracer_zrange
+from fs_likelihood import (
+    DEFAULT_MEASUREMENTS_DIR,
+    get_fit_fn,
+    get_synthetic_data,
+    get_theory,
+    get_tracer_zrange,
+)
 
 
 DEFAULT_TRACERS = ['BGS_z0', 'LRG_z0', 'LRG_z1', 'LRG_z2', 'ELG_z1', 'QSO_z0']
 DEFAULT_ELLS = [0, 2, 4]
 DEFAULT_COSMO_PARAMS = ['h', 'omega_cdm', 'omega_b', 'logA', 'n_s']
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FIG_DIR = REPO_ROOT / 'fig'
+BLINDING_DATA_DIR = REPO_ROOT / 'data' / 'blinding'
 
 
 def sample_from_gaussian(mean, covariance, size=1, seed=42):
@@ -73,10 +82,12 @@ def parse_args():
                         help='Slice of chain files to concatenate, matching notebook defaults.')
     parser.add_argument('--seed', type=int, default=42,
                         help='Seed for Gaussian posterior sampling.')
-    parser.add_argument('--plot-dir', type=Path, default=Path(__file__).resolve().parent / 'fig',
+    parser.add_argument('--plot-dir', type=Path, default=FIG_DIR,
                         help='Directory where output plots will be written.')
-    parser.add_argument('--shifts-dir', type=Path, default=Path(__file__).resolve().parent / 'data' / 'blinding',
+    parser.add_argument('--shifts-dir', type=Path, default=BLINDING_DATA_DIR,
                         help='Directory where shifts_blinding.npy will be written.')
+    parser.add_argument('--measurements-dir', type=Path, default=DEFAULT_MEASUREMENTS_DIR,
+                        help='Directory containing covariance_*.h5 and window_*.h5 measurement files.')
     parser.add_argument('--demo-name', default='LRG_z0',
                         help='Tracer namespace used for the apply/remove blinding check.')
     parser.add_argument('--skip-write-shifts', action='store_true',
@@ -86,9 +97,15 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_bestfit():
+def load_bestfit(theory_model):
     """Load the reference parameter dictionary from the joint full-shape fit."""
-    profiles = Profiles.load(get_fit_fn('profiles'))
+    profiles_fn = get_fit_fn('profiles', theory_model=theory_model)
+    if not profiles_fn.exists():
+        raise FileNotFoundError(
+            f'No profile found for theory model {theory_model!r} at {profiles_fn}. '
+            f'Run `python scripts/fs_likelihood.py --theory-model {theory_model} --todo profile` first.'
+        )
+    profiles = Profiles.load(profiles_fn)
     bestfit = profiles.bestfit.choice(index='argmax', input=True)
     return {name: float(value) for name, value in bestfit.items()}
 
@@ -100,14 +117,56 @@ def split_bestfit_params(bestfit):
     return cosmo_params, nuisance_params
 
 
-def load_chain(sampler_name, chain_slice):
+def load_chain(sampler_name, chain_slice, theory_model):
     """Concatenate the selected chain files."""
     start, stop = chain_slice
-    chain_fns = get_fit_fn('chains', sampler_name=sampler_name)[start:stop]
+    chain_fns = get_fit_fn('chains', sampler_name=sampler_name, theory_model=theory_model)[start:stop]
+    missing = [str(fn) for fn in chain_fns if not fn.exists()]
+    if missing:
+        raise FileNotFoundError(
+            f'Missing chain files for theory model {theory_model!r}: {missing}. '
+            f'Run `python scripts/fs_likelihood.py --theory-model {theory_model} --todo sample '
+            f'--sampler {sampler_name}` first.'
+        )
     return Chain.concatenate([Chain.load(fn).ravel()[::1] for fn in chain_fns])
 
 
-def build_tracer_observable(namespace, cosmo_params, nuisance_params, ells, klim, rebin, theory_model):
+def get_expected_nuisance_params(tracer, theory_model):
+    """Return nuisance parameters accepted by the requested theory model."""
+    theory = get_theory(z=1.0, tracer=tracer, theory_model=theory_model)
+    cosmo_names = set(DEFAULT_COSMO_PARAMS) | {
+        'tau_reio', 'm_ncdm', 'N_eff', 'w0_fld', 'wa_fld', 'Omega_k', 'sigma8_m'
+    }
+    return {param.name for param in theory.runtime_info.pipeline.params if param.name not in cosmo_names}
+
+
+def validate_theory_consistency(bestfit, chain, tracers, theory_model):
+    """Raise a targeted error when saved fits do not match the requested theory model."""
+    chain_param_names = set(chain.params(input=True).keys())
+    for namespace in tracers:
+        tracer, _ = get_tracer_zrange(namespace)
+        expected = get_expected_nuisance_params(tracer=tracer, theory_model=theory_model)
+        bestfit_names = {
+            name.split('.')[-1]
+            for name in bestfit
+            if name.startswith(f'{namespace}.')
+        }
+        chain_names = {
+            name.split('.')[-1]
+            for name in chain_param_names
+            if name.startswith(f'{namespace}.')
+        }
+        unexpected = sorted((bestfit_names | chain_names) - expected)
+        if unexpected:
+            raise ValueError(
+                f'The saved best-fit/chain inputs for {namespace} are inconsistent with '
+                f'--theory-model {theory_model!r}. Unexpected nuisance parameters: {unexpected}. '
+                'Regenerate the profiles and chains with the same theory model used for blinding.'
+            )
+
+
+def build_tracer_observable(namespace, cosmo_params, nuisance_params, ells, klim, rebin, theory_model,
+                            measurements_dir):
     """Build the reference observable for one tracer."""
     tracer, zrange = get_tracer_zrange(namespace)
     data, covariance, window = get_synthetic_data(
@@ -118,6 +177,7 @@ def build_tracer_observable(namespace, cosmo_params, nuisance_params, ells, klim
         weights='default_fkp',
         klim=tuple(klim),
         rebin=rebin,
+        measurements_dir=measurements_dir,
     )
     theory = get_theory(z=window.theory.get(ells=0).z, tracer=tracer, theory_model=theory_model)
     theory.init.update(
@@ -167,7 +227,8 @@ def get_blinding_samples(bestfit, chain, num_samples, seed):
     ]
 
 
-def add_reference_observables(blinder, tracers, cosmo_params, nuisance_params, ells, klim, rebin, plot_dir, theory_model):
+def add_reference_observables(blinder, tracers, cosmo_params, nuisance_params, ells, klim, rebin, plot_dir,
+                              theory_model, measurements_dir):
     """Build and register one reference observable per tracer."""
     for namespace in tracers:
         data, covariance, _, _, observable = build_tracer_observable(
@@ -178,12 +239,13 @@ def add_reference_observables(blinder, tracers, cosmo_params, nuisance_params, e
             klim=klim,
             rebin=rebin,
             theory_model=theory_model,
+            measurements_dir=measurements_dir,
         )
         save_reference_plot(namespace, observable, data, covariance, plot_dir)
         blinder.add_observable(name=namespace, data=observable, covariance=covariance)
 
 
-def generate_blinded_realizations(blinder, tracers, samples, ells, klim, rebin, theory_model):
+def generate_blinded_realizations(blinder, tracers, samples, ells, klim, rebin, theory_model, measurements_dir):
     """Generate blinded observables by re-evaluating theory at shifted parameters."""
     for namespace in tracers:
         tracer, zrange = get_tracer_zrange(namespace)
@@ -195,6 +257,7 @@ def generate_blinded_realizations(blinder, tracers, samples, ells, klim, rebin, 
             weights='default_fkp',
             klim=tuple(klim),
             rebin=rebin,
+            measurements_dir=measurements_dir,
         )
         theory = get_theory(z=window.theory.get(ells=0).z, tracer=tracer, theory_model=theory_model)
         theory.init.update(
@@ -225,7 +288,7 @@ def save_blinded_plots(blinder, tracers, plot_dir, num_samples):
         plt.close(fig)
 
 
-def run_apply_remove_demo(name, ells, shifts_dir, klim, rebin):
+def run_apply_remove_demo(name, ells, shifts_dir, klim, rebin, measurements_dir):
     """Validate the high-level API on one tracer by applying and removing the saved shifts."""
     tracer, zrange = get_tracer_zrange(name)
     observable, _, _ = get_synthetic_data(
@@ -236,6 +299,7 @@ def run_apply_remove_demo(name, ells, shifts_dir, klim, rebin):
         weights='default_fkp',
         klim=tuple(klim),
         rebin=rebin,
+        measurements_dir=measurements_dir,
     )
     poles = [observable.get(ell) for ell in ells]
     k = poles[0].coords('k')
@@ -283,9 +347,12 @@ def main():
     args.plot_dir.mkdir(parents=True, exist_ok=True)
     args.shifts_dir.mkdir(parents=True, exist_ok=True)
 
-    bestfit = load_bestfit()
+    bestfit = load_bestfit(args.theory_model)
     cosmo_params, nuisance_params = split_bestfit_params(bestfit)
     blinder = TracerPowerSpectrumMultipolesBlinder()
+
+    chain = load_chain(args.sampler, args.chain_slice, args.theory_model)
+    validate_theory_consistency(bestfit, chain, args.tracers, args.theory_model)
 
     add_reference_observables(
         blinder=blinder,
@@ -297,9 +364,9 @@ def main():
         rebin=args.rebin,
         plot_dir=args.plot_dir,
         theory_model=args.theory_model,
+        measurements_dir=args.measurements_dir,
     )
 
-    chain = load_chain(args.sampler, args.chain_slice)
     samples = get_blinding_samples(bestfit, chain, args.num_samples, args.seed)
     generate_blinded_realizations(
         blinder=blinder,
@@ -309,6 +376,7 @@ def main():
         klim=args.klim,
         rebin=args.rebin,
         theory_model=args.theory_model,
+        measurements_dir=args.measurements_dir,
     )
     save_blinded_plots(blinder, args.tracers, args.plot_dir, args.num_samples)
 
@@ -322,6 +390,7 @@ def main():
             shifts_dir=args.shifts_dir,
             klim=args.klim,
             rebin=args.rebin,
+            measurements_dir=args.measurements_dir,
         )
 
 

@@ -14,9 +14,12 @@ from desilike import setup_logging
 import lsstypes as types
 
 
-output_dir = Path('/global/cfs/cdirs/desicollab/users/epaillas/code/desiblind/scripts/')
-emulator_dir = output_dir / 'emulators/ns/'
-#output_dir = Path('tests/')
+REPO_ROOT = Path(__file__).resolve().parents[1]
+data_dir = REPO_ROOT / 'data'
+output_dir = data_dir / 'fs_likelihood'
+emulator_dir = output_dir / 'emulators' / 'ns'
+fig_dir = REPO_ROOT / 'fig'
+DEFAULT_MEASUREMENTS_DIR = Path('/global/cfs/projectdirs/desi/mocks/cai/mock-challenge-cutsky-dr2/unblinded_data/dr2-v2')
 
 
 def get_tracer_zrange(name):
@@ -32,11 +35,12 @@ def get_tracer_zrange(name):
 
 
 def get_synthetic_data(statistic='mesh2_spectrum_poles', tracer='LRG', zrange=(0.4, 0.6),
-    region='GCcomb', ells=[0, 2, 4], weights='default_fkp', klim=(0., 0.3), rebin=5):
+    region='GCcomb', ells=[0, 2, 4], weights='default_fkp', klim=(0., 0.3), rebin=5,
+    measurements_dir=DEFAULT_MEASUREMENTS_DIR):
     """
     Synthetic data from Abacus-HF mocks for testing.
-    """    
-    dirname = Path('/global/cfs/projectdirs/desi/mocks/cai/mock-challenge-cutsky-dr2/unblinded_data/dr2-v2/')
+    """
+    dirname = Path(measurements_dir)
 
     zmin, zmax = zrange
     covariance = types.read(dirname / f'covariance_{statistic}_{tracer}_z{zmin}-{zmax}_{region}_{weights}.h5')
@@ -98,7 +102,9 @@ def get_theory(cosmo=None, z=1., tracer=None, theory_model='reptvelocileptors'):
     return theory
 
 
-def DESIFSLikelihood(tracers=None, cosmo=None, klim=(0.02, 0.2), solve='.auto'):
+def DESIFSLikelihood(tracers=None, cosmo=None, klim=(0.02, 0.2), solve='.auto',
+                     theory_model='reptvelocileptors',
+                     measurements_dir=DEFAULT_MEASUREMENTS_DIR):
     """Create DESI FS likelihood."""
 
     if tracers is None:
@@ -125,17 +131,19 @@ def DESIFSLikelihood(tracers=None, cosmo=None, klim=(0.02, 0.2), solve='.auto'):
             ells=[0, 2, 4],
             weights='default_fkp',
             klim=klim,
-            rebin=5
+            rebin=5,
+            measurements_dir=measurements_dir,
         )
         tracer_label = tracer.split('_')[0]
         # To reproduce previous bug:
         # tracer_label = 'QSO'  # FIXME
-        theory = get_theory(cosmo=cosmo, z=window.theory.get(ells=0).z, tracer=tracer_label)
+        theory = get_theory(cosmo=cosmo, z=window.theory.get(ells=0).z, tracer=tracer_label,
+                            theory_model=theory_model)
         observable = TracerPowerSpectrumMultipolesObservable(
             data=data,
             theory=theory,
             covariance=covariance,
-            wmatrix=window,
+            window=window,
         )
 
         # Compute or swap in PT emulator
@@ -152,7 +160,7 @@ def DESIFSLikelihood(tracers=None, cosmo=None, klim=(0.02, 0.2), solve='.auto'):
         else:
             observable()  # to set up k-ranges for the emulator
             from desilike.emulators import Emulator, TaylorEmulatorEngine
-            theory = observable.wmatrix.theory
+            # Use the original desilike calculator; observable.window.theory is only an lsstypes tree.
             #theory.init.update(ells=(0, 2, 4))  # train emulator on all multipoles
             emulator = Emulator(theory.pt, engine=TaylorEmulatorEngine(method='finite', order=4))
             emulator.set_samples()
@@ -184,18 +192,24 @@ def DESIFSLikelihood(tracers=None, cosmo=None, klim=(0.02, 0.2), solve='.auto'):
     return likelihood
 
 
-def get_fit_fn(kind='profiles', sampler_name='emcee'):
+def get_fit_fn(kind='profiles', sampler_name='emcee', theory_model='reptvelocileptors'):
+    if theory_model == 'reptvelocileptors':
+        fit_root = Path(output_dir)
+    else:
+        fit_root = Path(output_dir) / theory_model
+
     if kind == 'profiles':
-        save_dir = Path(output_dir) / 'profiles/solve-best-ns-kmax0.3'
+        save_dir = fit_root / 'profiles/solve-best-ns-kmax0.3'
         save_fn = save_dir / f'profiles_abacushf_fs.npy'
     elif kind == 'chains':
-        save_dir = Path(output_dir) / f'chains/solve-best-ns-kmax0.3/{sampler_name}'
+        save_dir = fit_root / f'chains/solve-best-ns-kmax0.3/{sampler_name}'
         save_fn = [save_dir / f'chain_abacushf_fs_{ichain:d}.npy' for ichain in range(4)]
     return save_fn
 
 
-def run_sampler(likelihood, sampler_name='emcee'):
-    save_fn = get_fit_fn('chains', sampler_name=sampler_name)
+def run_sampler(likelihood, sampler_name='emcee', theory_model='reptvelocileptors'):
+    save_fn = get_fit_fn('chains', sampler_name=sampler_name, theory_model=theory_model)
+    save_fn[0].parent.mkdir(parents=True, exist_ok=True)
     chain_fn = None
     if sampler_name == 'emcee':
         sampler = EmceeSampler(likelihood, chain_fn=chain_fn, nwalkers=64, save_fn=save_fn, seed=42)
@@ -204,8 +218,9 @@ def run_sampler(likelihood, sampler_name='emcee'):
     chains = sampler.run(min_iterations=200, check={'max_eigen_gr': 0.03})
 
 
-def run_profiler(likelihood):
-    save_fn = get_fit_fn('profiles')
+def run_profiler(likelihood, theory_model='reptvelocileptors'):
+    save_fn = get_fit_fn('profiles', theory_model=theory_model)
+    save_fn.parent.mkdir(parents=True, exist_ok=True)
     profiler = MinuitProfiler(likelihood, seed=42)
     profiles = profiler.maximize()
     print(profiles.to_stats(tablefmt='pretty'))
@@ -218,6 +233,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--todo", type=str, nargs='+', default=['profile', 'sample'],)
     parser.add_argument("--sampler", type=str, default='emcee',)
+    parser.add_argument("--theory-model", type=str, default='reptvelocileptors',
+                        choices=['reptvelocileptors', 'folpsD'])
+    parser.add_argument("--measurements-dir", type=Path, default=DEFAULT_MEASUREMENTS_DIR)
 
     args = parser.parse_args()
 
@@ -230,15 +248,18 @@ if __name__ == '__main__':
             cosmo=None,
             klim=(0., 0.3),
             solve='.best',
+            theory_model=args.theory_model,
+            measurements_dir=args.measurements_dir,
         )
 
     if 'sample' in todo:
-        run_sampler(likelihood, sampler_name=args.sampler)
+        run_sampler(likelihood, sampler_name=args.sampler, theory_model=args.theory_model)
 
     if 'profile' in todo:
-        profiles = run_profiler(likelihood)
-        profiles = Profiles.load(get_fit_fn('profiles'))
+        profiles = run_profiler(likelihood, theory_model=args.theory_model)
+        profiles = Profiles.load(get_fit_fn('profiles', theory_model=args.theory_model))
+        fig_dir.mkdir(parents=True, exist_ok=True)
         likelihood(**profiles.bestfit.choice(index='argmax', input=True))
         for tracer, likelihood in zip(tracers, likelihood.likelihoods):
             observable = likelihood.observables[0]
-            observable.plot(fn=output_dir / 'fig' / f'plot_bestfit_{tracer}.png')
+            observable.plot(fn=fig_dir / f'plot_bestfit_{tracer}.png')
