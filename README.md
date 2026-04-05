@@ -51,6 +51,22 @@ for i in range(100):
 blinder.write_blinded_shifts(save_dir='/path/to/shifts/')
 ```
 
+### Standalone notebook replacement
+
+To reproduce the end-to-end workflow from `nb/blinding_example.ipynb` as a
+script, run:
+
+```bash
+python scripts/blinding_example.py
+```
+
+By default this writes diagnostic plots to `scripts/fig/` and the generated
+`shifts_blinding.npy` file to `scripts/data/blinding/`. The script assumes the
+same DESI-compatible environment and external data products used by
+`scripts/fs_likelihood.py`. Use `python scripts/blinding_example.py --help` to
+override tracers, output locations, the number of blinded realizations, and the
+final apply/remove validation step.
+
 ### User workflow (applying and removing blinding)
 
 ```python

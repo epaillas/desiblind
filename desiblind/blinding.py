@@ -16,6 +16,7 @@ from desiblind.utils import set_plot_style
 
 
 SHIFTS_DIR = '/global/cfs/cdirs/desicollab/users/epaillas/y3-growth/dump/'
+SHIFTS_FILENAME = 'shifts_blinding.npy'
 
 
 class Observable:
@@ -79,7 +80,16 @@ class Blinder:
                 blinded_data = observable.reference_data.clone(value=np.ravel(blinded_data))
             observable.blinded_data.append(blinded_data)
 
-    def write_blinded_shifts(self, save_dir: Path | str = SHIFTS_DIR):
+    @staticmethod
+    def _get_shifts_fn(save_dir: Path | str | None = None, shifts_fn: Path | str | None = None) -> Path:
+        """Resolve the shifts file path from either a directory or a full filename."""
+        if shifts_fn is not None:
+            return Path(shifts_fn)
+        if save_dir is None:
+            save_dir = SHIFTS_DIR
+        return Path(save_dir) / SHIFTS_FILENAME
+
+    def write_blinded_shifts(self, save_dir: Path | str = SHIFTS_DIR, shifts_fn: Path | str | None = None):
         """
         Saves the shifts applied during blinding (obtained with the set_blinded_data function) to a file for later unblinding.
         """
@@ -94,7 +104,8 @@ class Blinder:
                     shifts[ell] = (k, diff)
                 namespace = hashlib.sha256(f'{observable.name}_bid{bid}'.encode()).hexdigest()
                 cout[namespace] = shifts
-        save_fn = Path(save_dir) / 'shifts_blinding.npy'
+        save_fn = self._get_shifts_fn(save_dir=save_dir, shifts_fn=shifts_fn)
+        save_fn.parent.mkdir(parents=True, exist_ok=True)
         np.save(save_fn, cout)
 
     @classmethod
@@ -102,6 +113,8 @@ class Blinder:
         cls,
         name: str,
         data: np.ndarray,
+        save_dir: Path | str | None = None,
+        shifts_fn: Path | str | None = None,
         **kwargs
     ) -> np.ndarray:
         """
@@ -121,7 +134,7 @@ class Blinder:
         -------
         blinded_data : np.ndarray or ObservableTree
         """
-        save_fn = Path(SHIFTS_DIR) / 'shifts_blinding.npy'
+        save_fn = cls._get_shifts_fn(save_dir=save_dir, shifts_fn=shifts_fn)
         shifts_dict = np.load(save_fn, allow_pickle=True).item()
         key = hashlib.sha256(f'{name}_bid{cls.__get_bid()}'.encode()).hexdigest()
         if key not in shifts_dict:
@@ -148,6 +161,8 @@ class Blinder:
         cls,
         name: str,
         data: np.ndarray,
+        save_dir: Path | str | None = None,
+        shifts_fn: Path | str | None = None,
         **kwargs,
     ) -> np.ndarray:
         """
@@ -169,7 +184,7 @@ class Blinder:
         """
         if not kwargs.get('force', False):
             raise ValueError('Are you sure you want to unblind? If so, provide "force=True"')
-        save_fn = Path(SHIFTS_DIR) / 'shifts_blinding.npy'
+        save_fn = cls._get_shifts_fn(save_dir=save_dir, shifts_fn=shifts_fn)
         shifts_dict = np.load(save_fn, allow_pickle=True).item()
         key = hashlib.sha256(f'{name}_bid{cls.__get_bid()}'.encode()).hexdigest()
         if key not in shifts_dict:
