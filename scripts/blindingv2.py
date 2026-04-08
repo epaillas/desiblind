@@ -18,6 +18,7 @@ os.environ.setdefault('JAX_PLATFORMS', 'cpu')
 os.environ.setdefault('MPLCONFIGDIR', '/tmp/matplotlib')
 
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import numpy as np
 from desilike.samples import Chain, Profiles
 
@@ -35,7 +36,7 @@ DEFAULT_DATASET = 'abacus-2ndgen-dr2-complete'
 DEFAULT_COVARIANCE_VERSION = 'holi-v3-altmtl'
 DEFAULT_STATS_DIR = Path('/global/cfs/cdirs/desicollab/science/cai/desi-clustering/dr2/summary_statistics/full_shape/base')
 DEFAULT_FITS_ROOT = Path(os.getenv('SCRATCH', '.')) / 'fits_abacus_mocks'
-DEFAULT_CACHE_DIR = Path('./_cache')
+DEFAULT_CACHE_DIR = Path('/Users/epaillas/code/desi-clustering/full_shape/job_scripts/_cache')
 FIG_DIR = REPO_ROOT / 'fig'
 BLINDING_DATA_DIR = REPO_ROOT / 'data' / 'blinding'
 SHIFTS_FILENAME = 'shifts_blinding.npy'
@@ -67,7 +68,9 @@ def parse_args():
         description='Blind DESI full-shape observables using saved full_shape fit products.'
     )
     parser.add_argument('--config-fn', type=Path, default=None,
-                        help='Explicit full_shape config.yaml path. If omitted the script resolves it from fit options.')
+                        help='Explicit full_shape config.yaml path inside a fit directory. If omitted the script resolves it from fit options.')
+    parser.add_argument('--fit-dir', type=Path, default=None,
+                        help='Explicit fit directory containing config.yaml, profiles.npy, and chain_*.npy.')
     parser.add_argument('--dataset', default=DEFAULT_DATASET,
                         help='Dataset used by validation_abacus_mocks.py.')
     parser.add_argument('--tracers', nargs='*', default=None,
@@ -92,7 +95,7 @@ def parse_args():
     parser.add_argument('--stats-dir', type=Path, default=DEFAULT_STATS_DIR,
                         help='Base directory containing full_shape measurement products.')
     parser.add_argument('--cache-dir', type=Path, default=DEFAULT_CACHE_DIR,
-                        help='Cache directory passed to full_shape helpers.')
+                        help='Cache root passed to full_shape helpers. This should contain prepared_stats/ and emulator_* subdirectories.')
     parser.add_argument('--cache-mode', default='rw', choices=['r', 'rw'],
                         help='Cache access mode for full_shape prepared stats and emulators.')
     parser.add_argument('--num-samples', type=int, default=100,
@@ -112,6 +115,25 @@ def parse_args():
     parser.add_argument('--skip-demo-apply-remove', action='store_true',
                         help='Skip the final power-spectrum apply/remove validation.')
     return parser.parse_args()
+
+
+def apply_runtime_overrides(options, args):
+    """Apply CLI overrides to options loaded from config.yaml."""
+    options = full_shape_tools.fill_fiducial_options(options)
+    for likelihood in options['likelihoods']:
+        covariance = likelihood.get('covariance', {})
+        if args.stats_dir is not None:
+            covariance['stats_dir'] = str(args.stats_dir)
+        for observable in likelihood['observables']:
+            observable['catalog']['stats_dir'] = str(args.stats_dir)
+            for select in observable['stat'].get('select', []):
+                if isinstance(select.get('ells'), list):
+                    select['ells'] = tuple(select['ells'])
+            if args.theory_model is not None:
+                if observable['stat']['kind'] == 'mesh3_spectrum' and args.theory_model == 'reptvelocileptors':
+                    raise ValueError('reptvelocileptors is not supported for mesh3_spectrum.')
+                observable['theory']['model'] = args.theory_model
+    return options
 
 
 def normalize_tracer(tracer):
@@ -168,8 +190,20 @@ def resolve_products(args):
         config_fn = args.config_fn
         if not config_fn.exists():
             raise FileNotFoundError(f'Config file does not exist: {config_fn}')
-        options = full_shape_tools.fill_fiducial_options(full_shape_tools.read_options(config_fn))
-        return options, config_fn.parent, config_fn
+        options = apply_runtime_overrides(full_shape_tools.read_options(config_fn), args)
+        fit_dir = config_fn.parent
+        fits_dir = fit_dir.parent
+        return options, fits_dir, config_fn
+
+    fit_dir_candidates = []
+    if args.fit_dir is not None:
+        fit_dir_candidates.append(args.fit_dir)
+    fit_dir_candidates.extend([args.fits_dir / args.dataset, args.fits_dir])
+    for fit_dir in fit_dir_candidates:
+        config_fn = fit_dir / 'config.yaml'
+        if config_fn.exists():
+            options = apply_runtime_overrides(full_shape_tools.read_options(config_fn), args)
+            return options, fit_dir.parent, config_fn
 
     options = build_options_from_args(args)
     candidates = [args.fits_dir / args.dataset, args.fits_dir]
@@ -178,19 +212,35 @@ def resolve_products(args):
         profiles_fn = get_fit_fn(options, fits_dir=fits_dir, kind='profiles')
         if config_fn.exists() or profiles_fn.exists():
             if config_fn.exists():
-                options = full_shape_tools.fill_fiducial_options(full_shape_tools.read_options(config_fn))
+                options = apply_runtime_overrides(full_shape_tools.read_options(config_fn), args)
             return options, fits_dir, config_fn
 
     checked = [str(get_fit_fn(options, fits_dir=fits_dir, kind='config', ext='yaml')) for fits_dir in candidates]
     raise FileNotFoundError(
-        'Could not resolve full_shape products. Checked config paths: '
-        f'{checked}. Provide --config-fn or matching fit selectors.'
+        'Could not resolve full_shape products. Checked fit directories and config paths: '
+        f'{[str(path / "config.yaml") for path in fit_dir_candidates] + checked}. '
+        'Provide --fit-dir, --config-fn, or matching fit selectors.'
     )
 
 
-def load_bestfit(options, fits_dir):
+def get_product_path(options, fits_dir, kind, config_fn=None, ichain=None, ext='npy'):
+    """Resolve a fit product path for either a fit root or an explicit fit directory."""
+    if config_fn is not None:
+        fit_dir = config_fn.parent
+        if kind == 'config':
+            return config_fn
+        if kind == 'profiles':
+            return fit_dir / 'profiles.npy'
+        if kind == 'chain':
+            if ichain is None:
+                raise ValueError('ichain must be provided when resolving chain products.')
+            return fit_dir / f'chain_{ichain}.npy'
+    return get_fit_fn(options, fits_dir=fits_dir, kind=kind, ichain=ichain, ext=ext)
+
+
+def load_bestfit(options, fits_dir, config_fn=None):
     """Load the best-fit parameter dictionary from full_shape profiles."""
-    profiles_fn = get_fit_fn(options, fits_dir=fits_dir, kind='profiles')
+    profiles_fn = get_product_path(options, fits_dir=fits_dir, kind='profiles', config_fn=config_fn)
     if not profiles_fn.exists():
         raise FileNotFoundError(
             f'No profile found at {profiles_fn}. Run the corresponding full_shape profile job first.'
@@ -200,13 +250,16 @@ def load_bestfit(options, fits_dir):
     return {name: float(value) for name, value in bestfit.items()}
 
 
-def load_chain(options, fits_dir, chain_slice=None):
+def load_chain(options, fits_dir, chain_slice=None, config_fn=None):
     """Concatenate available full_shape chain files."""
     if chain_slice is not None:
         start, stop = chain_slice
-        chain_fns = [get_fit_fn(options, fits_dir=fits_dir, kind='chain', ichain=ichain) for ichain in range(start, stop)]
+        chain_fns = [
+            get_product_path(options, fits_dir=fits_dir, kind='chain', ichain=ichain, config_fn=config_fn)
+            for ichain in range(start, stop)
+        ]
     else:
-        chain_dir = get_fit_fn(options, fits_dir=fits_dir, kind='chain', ichain=0).parent
+        chain_dir = get_product_path(options, fits_dir=fits_dir, kind='chain', ichain=0, config_fn=config_fn).parent
         chain_fns = sorted(chain_dir.glob('chain*.npy'))
     if not chain_fns:
         raise FileNotFoundError(
@@ -255,6 +308,12 @@ def get_output_name(stat, tracerz):
     return f'{base}__{STAT_TO_SUFFIX[stat]}'
 
 
+def get_plot_name(stat, tracerz):
+    """Build a consistent filename stem for diagnostic plots."""
+    base = TRACERZ_TO_LEGACY.get(tracerz, tracerz)
+    return f'{base}_{STAT_TO_SUFFIX[stat]}'
+
+
 def get_param_namespace(observable_options):
     return full_shape_tools._str_from_observable_options(  # noqa: SLF001
         observable_options,
@@ -262,56 +321,74 @@ def get_param_namespace(observable_options):
     )
 
 
-def build_reference_observable(state, params):
-    """Evaluate the convolved reference observable for one state."""
-    prediction = state['theory'](**params)
-    if state['window'] is None:
-        return state['data'].clone(value=np.ravel(prediction))
-    return state['window'].dot(np.ravel(prediction), return_type=None, zpt=False)
+def clone_theory_as_observable(observable):
+    """Clone the current convolved theory prediction onto the observable data tree."""
+    return observable.data.clone(value=np.asarray(observable.flattheory))
+
+
+def attach_plot_covariance(observable, sublikelihood):
+    """Attach the per-observable covariance expected by full_shape plotting helpers."""
+    plot_covariance = sublikelihood.covariance.at.observable.get(observables=observable.name)
+    plot_covariance = plot_covariance.at.observable.match(
+        observable.data.clone(value=0. * observable.data.value())
+    )
+    observable.covariance = plot_covariance
+    return plot_covariance
+
+
+def validate_stats_access(options, cache_dir, cache_mode):
+    """Ensure either the live stats dirs or the prepared cache can satisfy the fit config."""
+    prepared_cache_dir = Path(cache_dir) / 'prepared_stats' if cache_dir is not None else None
+    cache_can_read = prepared_cache_dir is not None and prepared_cache_dir.exists() and 'r' in cache_mode
+    missing_stats_dirs = sorted({
+        str(path) for path in
+        [observable['catalog'].get('stats_dir') for likelihood in options['likelihoods'] for observable in likelihood['observables']]
+        + [likelihood.get('covariance', {}).get('stats_dir') for likelihood in options['likelihoods']]
+        if path is not None and not Path(path).exists()
+    })
+    if missing_stats_dirs and not cache_can_read:
+        raise FileNotFoundError(
+            'One or more full_shape measurement directories do not exist: '
+            f'{missing_stats_dirs}. Provide --stats-dir to override the config paths or --cache-dir to use prepared cached products.'
+        )
 
 
 def build_states(options, cache_dir, cache_mode):
-    """Load prepared stats and theory objects for every observable in every likelihood."""
+    """Build the joint full_shape likelihood and collect plot-ready observable states."""
+    validate_stats_access(options, cache_dir=cache_dir, cache_mode=cache_mode)
+    likelihood = full_shape_tools.get_likelihood(
+        likelihoods_options=options['likelihoods'],
+        cosmology_options=options['cosmology'],
+        cache_dir=cache_dir,
+        cache_mode=cache_mode,
+    )
     states = []
-    cosmology = full_shape_tools.get_cosmology(options['cosmology'])
-    for likelihood_options in options['likelihoods']:
-        stats = full_shape_tools.get_stats(
-            likelihood_options['observables'],
-            covariance_options=likelihood_options.get('covariance', {}),
-            unpack=True,
-            cache_dir=cache_dir,
-            cache_mode=cache_mode,
-        )
-        data_list, window_list, covariance = stats
-        labels = covariance.observable.labels(level=1)
-        for observable_options, data, window, label in zip(likelihood_options['observables'], data_list, window_list, labels, strict=True):
+    for ilikelihood, (likelihood_options, sublikelihood) in enumerate(
+        zip(options['likelihoods'], likelihood.likelihoods, strict=True)
+    ):
+        for iobservable, (observable_options, observable) in enumerate(
+            zip(likelihood_options['observables'], sublikelihood.observables, strict=True)
+        ):
             stat = observable_options['stat']['kind']
             tracerz = tracerz_from_catalog(observable_options['catalog']['tracer'], observable_options['catalog'].get('zrange'))
-            data_attrs = dict(data.attrs) | label
-            if window is not None:
-                for _, pole in window.observable.items(level=None):
-                    data_attrs['z'] = pole.attrs.get('zeff', data_attrs.get('z'))
-                    break
-            theory = full_shape_tools.get_theory(
-                stat,
-                theory_options=observable_options['theory'],
-                cosmology=cosmology,
-                data_attrs=data_attrs,
-                data=data,
-            )
+            covariance = attach_plot_covariance(observable, sublikelihood)
             state = {
                 'stat': stat,
                 'tracerz': tracerz,
                 'output_name': get_output_name(stat, tracerz),
+                'plot_name': get_plot_name(stat, tracerz),
                 'observable_options': observable_options,
                 'param_namespace': get_param_namespace(observable_options),
-                'data': data,
-                'covariance': covariance.at.observable.match(data),
-                'window': window,
-                'theory': theory,
+                'data': observable.data,
+                'covariance': covariance,
+                'observable': observable,
+                'window': getattr(observable, 'window', None),
+                'theory': observable.theory,
+                'ilikelihood': ilikelihood,
+                'iobservable': iobservable,
             }
             states.append(state)
-    return states
+    return likelihood, states
 
 
 def get_blinder_for_stat(stat):
@@ -330,39 +407,124 @@ def get_chain_param_dict(bestfit, chain, sample):
     return fixed_cosmo | dict(zip(sampled_cosmo, sample, strict=True)) | {name: bestfit[name] for name in nuisance}
 
 
-def flatten_observable(observable):
-    return np.asarray(observable.value()).reshape(-1)
-
-
-def save_reference_plot(state, observable, output_dir):
-    """Save a generic reference plot for one observable."""
-    x = np.arange(observable.size)
-    y = flatten_observable(observable)
-    std = np.sqrt(np.diag(state['covariance'].value()))
-    fig, ax = plt.subplots(figsize=(5, 3))
-    ax.plot(x, y, color='C0', linestyle='--', label='reference')
-    ax.errorbar(x, flatten_observable(state['data']), yerr=std, color='C1', ls='none', marker='o', ms=2.5, label='data')
-    ax.set_xlabel('Bin index')
-    ax.set_ylabel(state['stat'])
-    ax.legend()
-    plt.tight_layout()
-    fig.savefig(output_dir / f'reference_{state["output_name"]}.png', dpi=300)
+def save_reference_plot(state, output_dir):
+    """Save the reference plot using the native full_shape observable plotting helper."""
+    fig = state['observable'].plot(kw_theory=get_multipole_plot_styles(state, variant='reference'))
+    fig.savefig(output_dir / f'reference_{state["plot_name"]}.png', dpi=300)
     plt.close(fig)
 
 
+def get_plot_coordinates(state, label):
+    """Return plotting coordinates and scaling matching the native desilike observable plotters."""
+    data_pole = state['observable'].data.get(**label)
+    if state['stat'] == 'mesh2_spectrum':
+        x = data_pole.coords('k')
+        scale = x
+        xlabel = r'$k$ [$h/\mathrm{Mpc}$]'
+        ylabel = r'$k P_{\ell}(k)$ [$(\mathrm{Mpc}/h)^{2}$]'
+        residual = rf'$\Delta P_{{{label["ells"]}}} / \sigma_{{ P_{{{label["ells"]}}} }}$'
+        return x, scale, xlabel, ylabel, residual
+
+    if state['stat'] == 'mesh3_spectrum':
+        if 'scoccimarro' in data_pole.basis:
+            x = np.arange(data_pole.size)
+            scale = data_pole.coords('k').prod(axis=-1)
+            xlabel = r'$k$ triangle index'
+            ylabel = r'$k_1 k_2 k_3 B_{\ell}(k_1, k_2, k_3)$ [$(\mathrm{Mpc}/h)^3$]'
+        elif 'sugiyama' in data_pole.basis:
+            k = data_pole.coords('k')
+            scale = k.prod(axis=-1)
+            if np.allclose(k[..., 1], k[..., 0]):
+                x = k[..., 0]
+                xlabel = r'$k$ [$h/\mathrm{Mpc}$]'
+            else:
+                x = np.arange(data_pole.size)
+                xlabel = r'$k$ triangle index'
+            ylabel = r'$k^2 B_{\ell}(k, k)$ [$(\mathrm{Mpc}/h)^4$]'
+        else:
+            raise ValueError(f'Unsupported bispectrum basis: {data_pole.basis}')
+        residual = rf'$\Delta B_{{{label["ells"]}}} / \sigma_{{ B_{{{label["ells"]}}} }}$'
+        return x, scale, xlabel, ylabel, residual
+
+    raise ValueError(f'Unsupported observable for plotting: {state["stat"]}')
+
+
+def blend_color(color, target='black', amount=0.35):
+    """Blend a matplotlib color toward a target color."""
+    rgb = np.array(mcolors.to_rgb(color))
+    target_rgb = np.array(mcolors.to_rgb(target))
+    return tuple((1.0 - amount) * rgb + amount * target_rgb)
+
+
+def get_multipole_plot_styles(state, variant):
+    """Return one plotting style per multipole label."""
+    labels = state['observable'].data.labels()
+    styles = []
+    for ill, _ in enumerate(labels):
+        base_color = f'C{ill:d}'
+        if variant == 'reference':
+            styles.append({
+                'color': blend_color(base_color, target='black', amount=0.25),
+                'lw': 1.8,
+                'alpha': 1.0,
+                'label': 'reference' if ill == 0 else None,
+            })
+        elif variant == 'shifted':
+            styles.append({
+                'color': blend_color(base_color, target='white', amount=0.2),
+                'lw': 0.9,
+                'alpha': 0.2,
+                'label': 'shifted' if ill == 0 else None,
+            })
+        else:
+            raise ValueError(f'Unknown plot style variant: {variant}')
+    return styles
+
+
+def overlay_shifted_theory(state, fig, theory_observable, kw_theory=None):
+    """Overlay one shifted model on top of the native full_shape reference figure."""
+    if kw_theory is None:
+        kw_theory = {}
+    labels = state['observable'].data.labels()
+    if isinstance(kw_theory, dict):
+        kw_theory = [kw_theory] * len(labels)
+    elif len(kw_theory) != len(labels):
+        kw_theory = [{key: value for key, value in kw_theory[0].items() if (key != 'label') or (ill == 0)} for ill in range(len(labels))]
+    axes = fig.axes
+    for ill, label in enumerate(labels):
+        data_pole = state['observable'].data.get(**label)
+        theory_pole = theory_observable.get(**label)
+        std = state['observable'].covariance.at.observable.get(**label).std()
+        x, scale, _, _, residual_ylabel = get_plot_coordinates(state, label)
+        style = kw_theory[ill]
+        axes[0].plot(x, scale * theory_pole.value(), **style)
+        axes[ill + 1].plot(x, (data_pole.value() - theory_pole.value()) / std, **style)
+        axes[ill + 1].set_ylabel(residual_ylabel)
+    if any(style.get('label') for style in kw_theory):
+        axes[0].legend()
+
+
 def save_blinded_plot(state, blinder, output_dir, num_samples):
-    """Save blinded realizations against the reference observable."""
-    observable = next(observable for observable in blinder.observables if observable.name == state['output_name'])
-    x = np.arange(observable.reference_data.size)
-    fig, ax = plt.subplots(figsize=(5, 3))
-    ax.plot(x, flatten_observable(observable.reference_data), color='k', lw=1.2, label='reference')
-    for blinded in observable.blinded_data[:num_samples]:
-        ax.plot(x, flatten_observable(blinded), color='C0', alpha=0.15, lw=0.8)
-    ax.set_xlabel('Bin index')
-    ax.set_ylabel(state['stat'])
-    ax.legend()
-    plt.tight_layout()
-    fig.savefig(output_dir / f'blinding_shifts_{state["output_name"]}.png', dpi=300)
+    """Save shifted realizations using the same observable coordinates and residual panels as full_shape."""
+    blinder_observable = next(observable for observable in blinder.observables if observable.name == state['output_name'])
+    observable = state['observable']
+    live_flattheory = np.asarray(observable.flattheory).copy()
+    observable.flattheory = np.asarray(state['reference'].value())
+    try:
+        fig = observable.plot(kw_theory=get_multipole_plot_styles(state, variant='reference'))
+    finally:
+        observable.flattheory = live_flattheory
+    for index, blinded in enumerate(blinder_observable.blinded_data[:num_samples]):
+        shifted_styles = get_multipole_plot_styles(state, variant='shifted')
+        if index > 0:
+            shifted_styles = [{**style, 'label': None} for style in shifted_styles]
+        overlay_shifted_theory(
+            state,
+            fig,
+            blinded,
+            kw_theory=shifted_styles,
+        )
+    fig.savefig(output_dir / f'blinding_shifts_{state["plot_name"]}.png', dpi=300)
     plt.close(fig)
 
 
@@ -446,25 +608,21 @@ def main():
     args.shifts_dir.mkdir(parents=True, exist_ok=True)
     args.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    options, fits_dir, _ = resolve_products(args)
-    bestfit = load_bestfit(options, fits_dir=fits_dir)
-    chain = load_chain(options, fits_dir=fits_dir, chain_slice=args.chain_slice)
-    states = build_states(options, cache_dir=args.cache_dir, cache_mode=args.cache_mode)
+    options, fits_dir, config_fn = resolve_products(args)
+    bestfit = load_bestfit(options, fits_dir=fits_dir, config_fn=config_fn)
+    chain = load_chain(options, fits_dir=fits_dir, chain_slice=args.chain_slice, config_fn=config_fn)
+    plotting_likelihood, states = build_states(options, cache_dir=args.cache_dir, cache_mode=args.cache_mode)
 
     blinders = {}
     for state in states:
         blinders.setdefault(state['stat'], get_blinder_for_stat(state['stat']))
 
+    plotting_likelihood(**bestfit)
     for state in states:
-        reference_params = {
-            name.split('.')[-1]: value
-            for name, value in bestfit.items()
-            if '.' not in name or name.startswith(f'{state["param_namespace"]}.')
-        }
-        reference = build_reference_observable(state, reference_params)
+        reference = clone_theory_as_observable(state['observable'])
         state['reference'] = reference
         blinders[state['stat']].add_observable(name=state['output_name'], data=reference, covariance=state['covariance'])
-        save_reference_plot(state, reference, args.plot_dir)
+        save_reference_plot(state, args.plot_dir)
 
     sampled_cosmo = get_sampled_cosmo_param_names(chain)
     samples = sample_from_gaussian(
@@ -475,26 +633,22 @@ def main():
     )
     for sample in samples:
         sample_params = get_chain_param_dict(bestfit, chain, sample)
+        plotting_likelihood(**sample_params)
         for state in states:
-            params = {
-                name.split('.')[-1]: value
-                for name, value in sample_params.items()
-                if name in sampled_cosmo or name.startswith(f'{state["param_namespace"]}.')
-            }
-            blinded = build_reference_observable(state, params)
+            blinded = clone_theory_as_observable(state['observable'])
             blinders[state['stat']].set_blinded_data(state['output_name'], blinded_data=blinded)
 
     for state in states:
         save_blinded_plot(state, blinders[state['stat']], args.plot_dir, args.num_samples)
 
-    if not args.skip_write_shifts:
-        write_combined_shifts(blinders, save_dir=args.shifts_dir)
+    # if not args.skip_write_shifts:
+    #     write_combined_shifts(blinders, save_dir=args.shifts_dir)
 
-    if not args.skip_demo_apply_remove:
-        demo_name = choose_demo_name(states, requested_name=args.demo_name)
-        if demo_name is not None:
-            demo_state = next(state for state in states if state['output_name'] == demo_name and state['stat'] == 'mesh2_spectrum')
-            run_apply_remove_demo(demo_name, shifts_dir=args.shifts_dir, state=demo_state)
+    # if not args.skip_demo_apply_remove:
+    #     demo_name = choose_demo_name(states, requested_name=args.demo_name)
+    #     if demo_name is not None:
+    #         demo_state = next(state for state in states if state['output_name'] == demo_name and state['stat'] == 'mesh2_spectrum')
+    #         run_apply_remove_demo(demo_name, shifts_dir=args.shifts_dir, state=demo_state)
 
 
 if __name__ == '__main__':
