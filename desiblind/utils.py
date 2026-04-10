@@ -1,4 +1,5 @@
 import argparse
+import copy
 from functools import wraps
 
 import numpy as np
@@ -44,6 +45,14 @@ def clear_eval_kmax_overrides(args):
     return cleared
 
 
+def clear_eval_ells_overrides(args):
+    """Return a shallow copy of args with evaluation-multipole overrides cleared."""
+    cleared = argparse.Namespace(**vars(args))
+    if hasattr(cleared, 'eval_ells_mesh2'):
+        setattr(cleared, 'eval_ells_mesh2', None)
+    return cleared
+
+
 def apply_eval_kmax_override(options, eval_kmax_by_stat):
     """Override the upper k limit used when rebuilding observables for blinding."""
     for likelihood in options['likelihoods']:
@@ -55,6 +64,44 @@ def apply_eval_kmax_override(options, eval_kmax_by_stat):
                 if 'k' not in select:
                     continue
                 select['k'] = replace_select_upper_limit(select['k'], new_max)
+    return options
+
+
+def apply_eval_ells_override(options, eval_ells_mesh2=None):
+    """Override the power-spectrum multipoles used when rebuilding observables for blinding."""
+    if eval_ells_mesh2 is None:
+        return options
+    eval_ells_mesh2 = tuple(dict.fromkeys(int(ell) for ell in eval_ells_mesh2))
+    for likelihood in options['likelihoods']:
+        for observable in likelihood['observables']:
+            if observable['stat']['kind'] != 'mesh2_spectrum':
+                continue
+            selects = observable['stat'].get('select', [])
+            existing_by_ell = {}
+            passthrough = []
+            for select in selects:
+                ell = select.get('ells')
+                if isinstance(ell, (int, np.integer)):
+                    existing_by_ell[int(ell)] = copy.deepcopy(select)
+                else:
+                    passthrough.append(copy.deepcopy(select))
+            if existing_by_ell:
+                template_select = existing_by_ell[max(existing_by_ell)]
+                updated_selects = []
+                for ell in eval_ells_mesh2:
+                    updated = copy.deepcopy(existing_by_ell.get(ell, template_select))
+                    updated['ells'] = ell
+                    updated_selects.append(updated)
+                observable['stat']['select'] = updated_selects + passthrough
+            elif selects:
+                template_select = copy.deepcopy(selects[-1])
+                observable['stat']['select'] = [
+                    copy.deepcopy(template_select) | {'ells': ell}
+                    for ell in eval_ells_mesh2
+                ]
+            else:
+                observable['stat']['select'] = [{'ells': ell} for ell in eval_ells_mesh2]
+            observable.setdefault('theory', {}).setdefault('options', {})['ells'] = eval_ells_mesh2
     return options
 
 

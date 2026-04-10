@@ -37,7 +37,9 @@ from desiblind.tracers import (
     to_tracerbin_name,
 )
 from desiblind.utils import (
+    apply_eval_ells_override,
     apply_eval_kmax_override,
+    clear_eval_ells_overrides,
     clear_eval_kmax_overrides,
     resolve_eval_kmax_overrides,
     validate_eval_kmax,
@@ -50,8 +52,8 @@ DEFAULT_STATS_DIR = Path('/global/cfs/cdirs/desicollab/science/cai/desi-clusteri
 DEFAULT_FITS_ROOT = Path(os.getenv('SCRATCH', '.')) / 'fits_abacus_mocks'
 DEFAULT_CACHE_DIR = Path('/Users/epaillas/code/desi-clustering/full_shape/job_scripts/_cache')
 FIG_DIR = REPO_ROOT / 'fig'
-BLINDING_DATA_DIR = REPO_ROOT / 'data' / 'blinding'
-SHIFTS_FILENAME = 'shifts_blinding.npy'
+BLINDING_DATA_DIR = '/global/cfs/cdirs/desicollab/users/epaillas/y3-growth/dump/'
+SHIFTS_FILENAME = 'shifts_blinding_2026_04.npy'
 PREFERRED_COSMO_PARAMS = ['h', 'omega_cdm', 'omega_b', 'logA', 'n_s', 'theta_MC_100', 'df', 'dm', 'dh', 'qpar', 'qper']
 STAT_TO_SUFFIX = {
     'mesh2_spectrum': 'mesh2_spectrum',
@@ -84,6 +86,8 @@ def parse_args():
                         help='Optional kmax override used only for mesh2_spectrum when rebuilding observables for blinding.')
     parser.add_argument('--eval-kmax-mesh3', type=float, default=None,
                         help='Optional kmax override used only for mesh3_spectrum when rebuilding observables for blinding.')
+    parser.add_argument('--eval-ells-mesh2', nargs='+', type=int, default=None,
+                        help='Optional mesh2_spectrum multipoles used only when rebuilding observables for blinding, e.g. --eval-ells-mesh2 0 2 4. This does not change which fit products are loaded.')
     parser.add_argument('--region', default='GCcomb',
                         help='Sky region used by full_shape.')
     parser.add_argument('--template', default='direct',
@@ -135,6 +139,7 @@ def get_eval_kmax_by_stat(args):
 def apply_runtime_overrides(options, args, include_eval_kmax=True):
     """Apply CLI overrides to options loaded from config.yaml."""
     options = full_shape_tools.fill_fiducial_options(options)
+    options = apply_eval_ells_override(options, args.eval_ells_mesh2)
     if include_eval_kmax:
         options = apply_eval_kmax_override(options, get_eval_kmax_by_stat(args))
     for likelihood in options['likelihoods']:
@@ -203,7 +208,7 @@ def get_fit_fn(options, fits_dir, kind, ichain=None, ext='npy'):
 
 def resolve_products(args):
     """Resolve config, fit root, and options from explicit config or fit selectors."""
-    fit_args = clear_eval_kmax_overrides(args)
+    fit_args = clear_eval_ells_overrides(clear_eval_kmax_overrides(args))
     if args.config_fn is not None:
         config_fn = args.config_fn
         if not config_fn.exists():
