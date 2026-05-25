@@ -53,7 +53,7 @@ DEFAULT_FITS_ROOT = Path(os.getenv('SCRATCH', '.')) / 'fits_abacus_mocks'
 DEFAULT_CACHE_DIR = Path('/Users/epaillas/code/desi-clustering/full_shape/job_scripts/_cache')
 FIG_DIR = REPO_ROOT / 'fig'
 BLINDING_DATA_DIR = '/global/cfs/cdirs/desicollab/users/epaillas/y3-growth/dump/'
-SHIFTS_FILENAME = 'shifts_blinding_2026_04.npy'
+SHIFTS_FILENAME = 'shifts_blinding_2026_05.npy'
 PREFERRED_COSMO_PARAMS = ['h', 'omega_cdm', 'omega_b', 'logA', 'n_s', 'theta_MC_100', 'df', 'dm', 'dh', 'qpar', 'qper']
 STAT_TO_SUFFIX = {
     'mesh2_spectrum': 'mesh2_spectrum',
@@ -67,7 +67,7 @@ def sample_from_gaussian(mean, covariance, size=1, seed=42):
     return rng.multivariate_normal(mean, covariance, size=size)
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description='Blind DESI full-shape observables using saved full_shape fit products.'
     )
@@ -79,8 +79,8 @@ def parse_args():
                         help='Tracer labels in full_shape or legacy notation, e.g. LRG1 ELG2 or LRG_z0 ELG_z1.')
     parser.add_argument('--sample-tracers', nargs='*', default=None,
                         help='Tracer labels used only to resolve the chain and baseline profile. Defaults to --tracers.')
-    parser.add_argument('--nuisance-profile', action='append', default=[], metavar='TRACER=PATH',
-                        help='Override nuisance parameters for TRACER from a full_shape profiles.npy file. Can be repeated.')
+    parser.add_argument('--nuisance-profile', action='extend', nargs='+', default=[], metavar='TRACER=PATH',
+                        help='Override nuisance parameters for TRACER from full_shape profiles.npy files. Accepts one or more TRACER=PATH values and can be repeated.')
     parser.add_argument('--stats', nargs='*', default=['mesh2_spectrum', 'mesh3_spectrum'],
                         choices=['mesh2_spectrum', 'mesh3_spectrum'],
                         help='Statistics to resolve when reconstructing fit paths.')
@@ -128,7 +128,7 @@ def parse_args():
                         help='Skip writing shifts_blinding.npy to disk.')
     parser.add_argument('--skip-demo-apply-remove', action='store_true',
                         help='Skip the final power-spectrum apply/remove validation.')
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def get_eval_kmax_by_stat(args):
@@ -723,6 +723,102 @@ def save_blinded_plot(state, blinder, output_dir, num_samples):
     plt.close(fig)
 
 
+def get_saved_shift(shifts, observable_name, bid):
+    """Return one saved shift entry from the combined shifts file."""
+    key = hashlib.sha256(f'{observable_name}_bid{bid}'.encode()).hexdigest()
+    if key not in shifts:
+        raise ValueError(f'Cannot find saved shift for {observable_name} bid {bid}.')
+    return shifts[key]
+
+
+def build_data_shift_plot_figure(state):
+    """Build a measured-data figure with residual panels for saved data shifts."""
+    labels = state['data'].labels()
+    fig, axes = plt.subplots(
+        len(labels) + 1,
+        1,
+        figsize=(6.0, 2.4 + 1.6 * len(labels)),
+        gridspec_kw={'height_ratios': [3.0] + [1.2] * len(labels), 'hspace': 0.05},
+        squeeze=False,
+    )
+    axes = axes[:, 0]
+    main_ylabel = None
+    xlabel = None
+
+    for ill, label in enumerate(labels):
+        pole = state['data'].get(**label)
+        x, scale, xlabel, ylabel, residual_ylabel = get_plot_coordinates(state, label)
+        if main_ylabel is None:
+            main_ylabel = ylabel
+        axes[0].plot(
+            x,
+            scale * pole.value(),
+            color=blend_color(f'C{ill:d}', target='black', amount=0.35),
+            lw=2.6,
+            alpha=1.0,
+            label='original data' if ill == 0 else None,
+            zorder=3,
+        )
+        axes[ill + 1].axhline(0., color='0.75', lw=0.8, zorder=0)
+        axes[ill + 1].set_ylabel(residual_ylabel)
+        if ill < len(labels) - 1:
+            axes[ill + 1].tick_params(labelbottom=False)
+
+    axes[0].set_ylabel(main_ylabel)
+    axes[0].tick_params(labelbottom=False)
+    if xlabel is not None:
+        axes[-1].set_xlabel(xlabel)
+    axes[0].legend()
+    fig.align_ylabels(axes)
+    return fig
+
+
+def overlay_shifted_data(state, fig, shifts, label_shifted=False):
+    """Overlay one shifted measured data vector and its residual shift."""
+    axes = fig.axes
+    labels = state['data'].labels()
+    for ill, label in enumerate(labels):
+        pole = state['data'].get(**label)
+        ell = label['ells']
+        if ell not in shifts:
+            raise ValueError(f'Cannot find saved shift for multipole {ell} in {state["output_name"]}.')
+        coords = pole.coords('k')
+        shift = TracerPowerSpectrumMultipolesBlinder._evaluate_shift(ell, coords, shifts[ell])  # noqa: SLF001
+        shifted_values = pole.value() + shift
+        std = state['covariance'].at.observable.get(**label).std()
+        x, scale, _, _, residual_ylabel = get_plot_coordinates(state, label)
+        style = {
+            'color': blend_color(f'C{ill:d}', target='white', amount=0.2),
+            'lw': 0.9,
+            'alpha': 0.2,
+            'label': 'shifted data' if label_shifted and ill == 0 else None,
+            'zorder': 1,
+        }
+        axes[0].plot(x, scale * shifted_values, **style)
+        axes[ill + 1].plot(x, shift / std, **style)
+        axes[ill + 1].set_ylabel(residual_ylabel)
+    if label_shifted:
+        axes[0].legend()
+
+
+def save_data_shift_plots(states, shifts_fn, output_dir, num_samples):
+    """Save measured-data shift plots using shifts read from disk."""
+    shifts = np.load(shifts_fn, allow_pickle=True).item()
+    for state in states:
+        if state['stat'] != 'mesh2_spectrum':
+            continue
+        fig = build_data_shift_plot_figure(state)
+        for bid in range(num_samples):
+            overlay_shifted_data(
+                state,
+                fig,
+                get_saved_shift(shifts, state['output_name'], bid),
+                label_shifted=bid == 0,
+            )
+        fig.savefig(output_dir / f'data_blinding_shifts_{state["plot_name"]}.png', dpi=300)
+        plt.close(fig)
+
+
 def write_combined_shifts(blinders, save_dir):
     """Write all blinded shifts to a single shifts_blinding.npy file."""
     output = {}
@@ -836,7 +932,8 @@ def main():
         save_blinded_plot(state, blinders[state['stat']], args.plot_dir, args.num_samples)
 
     if not args.skip_write_shifts:
-        write_combined_shifts(blinders, save_dir=args.shifts_dir)
+        shifts_fn = write_combined_shifts(blinders, save_dir=args.shifts_dir)
+        save_data_shift_plots(states, shifts_fn=shifts_fn, output_dir=args.plot_dir, num_samples=args.num_samples)
 
     if not args.skip_demo_apply_remove:
         demo_name = choose_demo_name(states, requested_name=args.demo_name)
