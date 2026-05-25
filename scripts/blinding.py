@@ -77,6 +77,10 @@ def parse_args():
                         help='Dataset used by validation_abacus_mocks.py.')
     parser.add_argument('--tracers', nargs='*', default=None,
                         help='Tracer labels in full_shape or legacy notation, e.g. LRG1 ELG2 or LRG_z0 ELG_z1.')
+    parser.add_argument('--sample-tracers', nargs='*', default=None,
+                        help='Tracer labels used only to resolve the chain and baseline profile. Defaults to --tracers.')
+    parser.add_argument('--nuisance-profile', action='append', default=[], metavar='TRACER=PATH',
+                        help='Override nuisance parameters for TRACER from a full_shape profiles.npy file. Can be repeated.')
     parser.add_argument('--stats', nargs='*', default=['mesh2_spectrum', 'mesh3_spectrum'],
                         choices=['mesh2_spectrum', 'mesh3_spectrum'],
                         help='Statistics to resolve when reconstructing fit paths.')
@@ -169,6 +173,12 @@ def resolve_tracers(tracers):
     return normalize_tracer_names(tracers, output='tracerbin')
 
 
+def set_args_tracers(args, tracers):
+    args = copy.copy(args)
+    args.tracers = tracers
+    return args
+
+
 def build_options_from_args(args):
     """Construct full_shape options when config.yaml is not provided."""
     likelihoods = []
@@ -250,6 +260,38 @@ def get_product_path(options, fits_dir, kind, config_fn=None, ichain=None, ext='
     return get_fit_fn(options, fits_dir=fits_dir, kind=kind, ichain=ichain, ext=ext)
 
 
+def parse_nuisance_profiles(specs):
+    """Return nuisance profile paths keyed by canonical tracer-bin name."""
+    profiles = {}
+    for spec in specs:
+        if '=' not in spec:
+            raise ValueError(f'Invalid --nuisance-profile {spec!r}; expected TRACER=PATH.')
+        tracer, path = spec.split('=', 1)
+        tracer = normalize_canonical_tracerbin_name(to_tracerbin_name(tracer.strip()))
+        if tracer in profiles:
+            raise ValueError(f'Duplicate --nuisance-profile entry for {tracer}.')
+        profiles[tracer] = Path(os.path.expandvars(os.path.expanduser(path.strip())))
+    return profiles
+
+
+def get_profile_config_fn(profiles_fn):
+    """Return the config.yaml next to a full_shape profiles.npy product."""
+    profiles_fn = Path(profiles_fn)
+    if not profiles_fn.exists():
+        raise FileNotFoundError(f'Nuisance profile does not exist: {profiles_fn}')
+    config_fn = profiles_fn.parent / 'config.yaml'
+    if not config_fn.exists():
+        raise FileNotFoundError(f'No config.yaml found next to nuisance profile: {profiles_fn}')
+    return config_fn
+
+
+def load_bestfit_from_profile(profiles_fn):
+    """Load the best-fit parameter dictionary from a full_shape profiles.npy file."""
+    profiles = Profiles.load(profiles_fn)
+    bestfit = profiles.bestfit.choice(index='argmax', input=True)
+    return {name: float(value) for name, value in bestfit.items()}
+
+
 def load_bestfit(options, fits_dir, config_fn=None):
     """Load the best-fit parameter dictionary from full_shape profiles."""
     profiles_fn = get_product_path(options, fits_dir=fits_dir, kind='profiles', config_fn=config_fn)
@@ -257,9 +299,7 @@ def load_bestfit(options, fits_dir, config_fn=None):
         raise FileNotFoundError(
             f'No profile found at {profiles_fn}. Run the corresponding full_shape profile job first.'
         )
-    profiles = Profiles.load(profiles_fn)
-    bestfit = profiles.bestfit.choice(index='argmax', input=True)
-    return {name: float(value) for name, value in bestfit.items()}
+    return load_bestfit_from_profile(profiles_fn)
 
 
 def load_chain(options, fits_dir, chain_slice=None, config_fn=None):
@@ -297,6 +337,76 @@ def get_sampled_cosmo_param_names(chain):
     raise ValueError('Could not identify cosmological parameters in the saved full_shape chain.')
 
 
+def get_tracer_nuisance_params(bestfit, tracer):
+    prefix = f'{tracer}.'
+    return {name: value for name, value in bestfit.items() if name.startswith(prefix)}
+
+
+def resolve_mixed_blinding_inputs(args):
+    """Resolve mixed observable options, baseline fit products, and nuisance overrides."""
+    requested_tracers = resolve_tracers(args.tracers)
+    sample_tracers = resolve_tracers(args.sample_tracers if args.sample_tracers is not None else args.tracers)
+    nuisance_profile_fns = parse_nuisance_profiles(args.nuisance_profile)
+
+    missing_sample = sorted(set(sample_tracers) - set(requested_tracers))
+    if missing_sample:
+        raise ValueError(f'--sample-tracers must be included in --tracers; got extra {missing_sample}.')
+    overlapping = sorted(set(sample_tracers) & set(nuisance_profile_fns))
+    if overlapping:
+        raise ValueError(f'--nuisance-profile tracers must be absent from --sample-tracers; got {overlapping}.')
+    missing_override = sorted(set(nuisance_profile_fns) - set(requested_tracers))
+    if missing_override:
+        raise ValueError(f'--nuisance-profile tracers must be included in --tracers; got extra {missing_override}.')
+
+    sample_args = set_args_tracers(args, sample_tracers)
+    sample_fit_options, fits_dir, config_fn = resolve_products(sample_args)
+    sample_likelihoods = map_likelihoods_by_tracer(sample_fit_options)
+
+    likelihoods_by_tracer = {}
+    for tracer in sample_tracers:
+        if tracer not in sample_likelihoods:
+            raise ValueError(f'Sampling fit products do not contain likelihood options for {tracer}.')
+        likelihoods_by_tracer[tracer] = sample_likelihoods[tracer]
+
+    override_nuisance = {}
+    for tracer, profiles_fn in nuisance_profile_fns.items():
+        config_fn_override = get_profile_config_fn(profiles_fn)
+        override_options = full_shape_tools.read_options(config_fn_override)
+        override_likelihoods = map_likelihoods_by_tracer(override_options)
+        if tracer not in override_likelihoods:
+            raise ValueError(f'Nuisance profile config {config_fn_override} does not contain {tracer}.')
+        likelihoods_by_tracer[tracer] = override_likelihoods[tracer]
+        tracer_bestfit = load_bestfit_from_profile(profiles_fn)
+        nuisance = get_tracer_nuisance_params(tracer_bestfit, tracer)
+        if not nuisance:
+            raise ValueError(f'Nuisance profile {profiles_fn} does not contain parameters prefixed by {tracer}.')
+        override_nuisance.update(nuisance)
+
+    missing_likelihoods = [tracer for tracer in requested_tracers if tracer not in likelihoods_by_tracer]
+    if missing_likelihoods:
+        raise ValueError(
+            f'No likelihood options found for {missing_likelihoods}. '
+            'Add them to --sample-tracers or provide --nuisance-profile TRACER=PATH.'
+        )
+
+    options = copy.deepcopy(sample_fit_options)
+    options['likelihoods'] = [copy.deepcopy(likelihoods_by_tracer[tracer]) for tracer in requested_tracers]
+    bestfit = load_bestfit(sample_fit_options, fits_dir=fits_dir, config_fn=config_fn)
+    bestfit.update(override_nuisance)
+    chain = load_chain(sample_fit_options, fits_dir=fits_dir, chain_slice=args.chain_slice, config_fn=config_fn)
+    return options, bestfit, chain, override_nuisance
+
+
+def resolve_blinding_inputs(args):
+    """Resolve fit options, best-fit parameters, chain, and explicit nuisance overrides."""
+    if args.sample_tracers is None and not args.nuisance_profile:
+        fit_options, fits_dir, config_fn = resolve_products(args)
+        bestfit = load_bestfit(fit_options, fits_dir=fits_dir, config_fn=config_fn)
+        chain = load_chain(fit_options, fits_dir=fits_dir, chain_slice=args.chain_slice, config_fn=config_fn)
+        return fit_options, bestfit, chain, {}
+    return resolve_mixed_blinding_inputs(args)
+
+
 def tracerz_from_catalog(tracer, zrange):
     """Translate a catalog tracer + zrange back to a full_shape tracer-bin label."""
     mapping = full_shape_tools.get_full_tracer_zrange(None)
@@ -315,6 +425,35 @@ def tracerz_from_catalog(tracer, zrange):
 def get_public_name(tracerz):
     """Build the bare public tracer-bin name used by the blinder API."""
     return to_tracerbin_name(tracerz)
+
+
+def get_likelihood_tracers(likelihood_options):
+    """Return the canonical tracer names represented by one likelihood block."""
+    tracers = []
+    for observable_options in likelihood_options['observables']:
+        tracerz = tracerz_from_catalog(
+            observable_options['catalog']['tracer'],
+            observable_options['catalog'].get('zrange'),
+        )
+        tracers.append(get_public_name(tracerz))
+    return sorted(set(tracers))
+
+
+def map_likelihoods_by_tracer(options):
+    """Map single-tracer likelihood blocks by canonical tracer name."""
+    mapped = {}
+    for likelihood_options in options['likelihoods']:
+        tracers = get_likelihood_tracers(likelihood_options)
+        if len(tracers) != 1:
+            raise ValueError(
+                'Mixed-product blinding only supports single-tracer likelihood blocks; '
+                f'got {tracers}.'
+            )
+        tracer = tracers[0]
+        if tracer in mapped:
+            raise ValueError(f'Multiple likelihood blocks found for tracer {tracer}.')
+        mapped[tracer] = likelihood_options
+    return mapped
 
 
 def get_output_name(stat, tracerz):
@@ -413,12 +552,18 @@ def get_blinder_for_stat(stat):
     raise ValueError(f'Unsupported observable for blinding: {stat}')
 
 
-def get_chain_param_dict(bestfit, chain, sample):
+def get_chain_param_dict(bestfit, chain, sample, extra_nuisance=None):
     names = list(chain.params(input=True).keys())
     sampled_cosmo = get_sampled_cosmo_param_names(chain)
     nuisance = [name for name in names if name not in sampled_cosmo]
     fixed_cosmo = {name: value for name, value in bestfit.items() if '.' not in name and name not in sampled_cosmo}
-    return fixed_cosmo | dict(zip(sampled_cosmo, sample, strict=True)) | {name: bestfit[name] for name in nuisance}
+    extra_nuisance = extra_nuisance or {}
+    return (
+        fixed_cosmo
+        | dict(zip(sampled_cosmo, sample, strict=True))
+        | {name: bestfit[name] for name in nuisance}
+        | extra_nuisance
+    )
 
 
 def save_reference_plot(state, output_dir):
@@ -657,10 +802,8 @@ def main():
     args.shifts_dir.mkdir(parents=True, exist_ok=True)
     args.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    fit_options, fits_dir, config_fn = resolve_products(args)
+    fit_options, bestfit, chain, extra_nuisance = resolve_blinding_inputs(args)
     options = apply_runtime_overrides(copy.deepcopy(fit_options), args)
-    bestfit = load_bestfit(fit_options, fits_dir=fits_dir, config_fn=config_fn)
-    chain = load_chain(fit_options, fits_dir=fits_dir, chain_slice=args.chain_slice, config_fn=config_fn)
     plotting_likelihood, states = build_states(options, cache_dir=args.cache_dir, cache_mode=args.cache_mode)
     validate_eval_kmax(states, get_eval_kmax_by_stat(args))
 
@@ -683,7 +826,7 @@ def main():
         seed=args.seed,
     )
     for sample in samples:
-        sample_params = get_chain_param_dict(bestfit, chain, sample)
+        sample_params = get_chain_param_dict(bestfit, chain, sample, extra_nuisance=extra_nuisance)
         plotting_likelihood(**sample_params)
         for state in states:
             blinded = clone_theory_as_observable(state['observable'])
