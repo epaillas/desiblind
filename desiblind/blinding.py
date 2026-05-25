@@ -17,7 +17,7 @@ from desiblind.tracers import normalize_canonical_tracerbin_name, to_tracerbin_n
 
 
 SHIFTS_DIR = '/global/cfs/cdirs/desicollab/users/epaillas/y3-growth/dump/'
-SHIFTS_FILENAME = 'shifts_blinding_2026_04.npy'
+SHIFTS_FILENAME = 'shifts_blinding_2026_05.npy'
 
 
 def is_observable_tree(data) -> bool:
