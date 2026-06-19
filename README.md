@@ -28,6 +28,49 @@ The package depends on [`desilike`](https://github.com/cosmodesi/desilike). Inst
 source /global/common/software/desi/users/adematti/cosmodesi_environment.sh main
 ```
 
+
+## Catalog-level BAO/AP blinding
+
+`desiblind` also provides a generic BAO/AP catalog-level redshift remapping API.
+Pipeline packages such as `desi-clustering` should still handle DESI catalog
+file discovery, `LSScats/` naming, region splitting, and job orchestration; the
+catalog blinder only handles the generic blinding transformation and private
+hash-key parameter-bank convention.
+
+```python
+from desiblind import CatalogBAOBlinder
+
+params = {'w0': -0.95, 'wa': 0.10}
+blinded = CatalogBAOBlinder.apply_blinding('LRG3', catalog, parameters=params)
+```
+
+For LSS-style full-catalog validation, the source and destination redshift
+columns can be specified separately:
+
+```python
+blinded = CatalogBAOBlinder.apply_blinding(
+    'LRG3', catalog, parameters=params, input_zcol='Z_not4clus', output_zcol='Z'
+)
+```
+
+Blind parameters can be saved in a private NumPy dictionary using the same
+hash-key style as the summary-statistic shifts:
+
+```python
+CatalogBAOBlinder.write_blinded_parameters('LRG3', params, save_dir='private')
+params = CatalogBAOBlinder.load_blinded_parameters('LRG3', save_dir='private')
+```
+
+Validation is split into two levels:
+
+1. Core redshift-remapping equivalence with
+   `LSS.blinding_tools.apply_zshift_DE`. This is covered by the lightweight
+   `tests/test_catalog.py` test that compares the cosmology formula directly.
+2. Full LSS workflow equivalence. This still needs to be run before production
+   use, because the LSS script applies BAO/AP blinding to `Z_not4clus`, clips
+   that input redshift column, recomputes `n(z)`, rescales `WEIGHT_SYS`, and
+   then builds clustering data/random catalogs.
+
 ## Examples
 
 See `nb/blinding_example_new.ipynb` for an up-to-date example of the API functionality.
