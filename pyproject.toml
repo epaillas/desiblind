@@ -11,7 +11,7 @@ name = "desiblind"
 authors = [{name = "Enrique Paillas"}]
 description = "Blinding for DESI galaxy clustering statistics"
 version = "0.0.0"
-dependencies = ["desilike"]
+dependencies = ["desilike", "cosmoprimo", "mockfactory"]
 readme = "README.md"
 requires-python = ">=3.10"
 urls = {Repository = "https://github.com/epaillas/desiblind"}
