@@ -17,5 +17,18 @@ requires-python = ">=3.10"
 urls = {Repository = "https://github.com/epaillas/desiblind"}
 classifiers = ["Programming Language :: Python :: 3"]
 
+[project.optional-dependencies]
+catalog = [
+    "cosmoprimo",
+    "mockfactory",
+    "mpi4py",
+    "pyrecon",
+    "PyYAML",
+]
+
+[project.scripts]
+desiblind-data-vector-parameters = "desiblind.data_vector_parameters:main"
+desiblind-catalog-parameters = "desiblind.catalog:main"
+
 [tool.setuptools]
 packages = ["desiblind"]
