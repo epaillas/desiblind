@@ -27,6 +27,10 @@ The two implementation modules are:
 - `desiblind.data_vector`: full-shape data-vector shifts for power-spectrum and bispectrum multipoles.
 - `desiblind.catalog`: BAO/RSD/fNL catalog-level blinding before measuring statistics.
 
+Catalog BAO/AP blinding is available through `TracerCatalogBlinder`; use `input_zcol="Z_not4clus", output_zcol="Z"` for the LSS full-catalog convention. For BAO/AP validation only, `transform_redshift(..., inverse=True)` and `remove_bao_blinding(..., force=True)` provide the inverse redshift mapping. RSD and fNL catalog blinding are apply-only.
+
+For production catalog blinding, pass the approved sealed parameter file explicitly with `parameters_fn`. If only `save_dir` is provided, `desiblind` looks for the generic default `catalog_blinding.npy`.
+
 ## Credits
 
 - Alejandro Perez Fernandez and Jiamin Hou for the original idea and script development.

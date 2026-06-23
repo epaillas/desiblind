@@ -25,7 +25,7 @@ class ToyCatalog(dict):
 
 
 def test_catalog_secret_loading_is_deterministic(tmp_path):
-    fn = tmp_path / "catalog_blinding_2026_06.npy"
+    fn = tmp_path / "analysis_catalog_blinding.npy"
     generate_catalog_parameters(
         parameters_fn=fn,
         w0=-0.99,
@@ -47,6 +47,74 @@ def test_catalog_secret_loading_is_deterministic(tmp_path):
     assert params["w0"] == pytest.approx(-0.99)
     assert params["wa"] == pytest.approx(0.05)
     assert params["fnl_blind"] == pytest.approx(7.0)
+
+
+def test_catalog_default_filename_and_save_dir_generation(tmp_path):
+    fn = TracerCatalogBlinder.get_parameters_fn(save_dir=tmp_path)
+    assert fn == tmp_path / "catalog_blinding.npy"
+
+    written = generate_catalog_parameters(
+        save_dir=tmp_path,
+        w0=-0.99,
+        wa=0.05,
+        fnl_blind=7.0,
+        validate=False,
+        overwrite=True,
+    )
+    assert written == fn
+    assert written.exists()
+
+
+def test_catalog_legacy_filename_fallback_warns(tmp_path):
+    legacy_fn = tmp_path / "catalog_blinding_2026_06.npy"
+    generate_catalog_parameters(
+        parameters_fn=legacy_fn,
+        w0=-0.99,
+        wa=0.05,
+        fnl_blind=7.0,
+        validate=False,
+        overwrite=True,
+    )
+
+    with pytest.warns(FutureWarning, match="legacy catalog blinding parameter file"):
+        params = TracerCatalogBlinder.load_parameters(
+            modes=["bao"],
+            save_dir=tmp_path,
+            metadata="sealed",
+            validate=False,
+        )
+    assert params["parameters_fn"] == str(legacy_fn)
+
+
+def test_catalog_generic_default_takes_precedence_over_legacy(tmp_path):
+    legacy_fn = tmp_path / "catalog_blinding_2026_06.npy"
+    generic_fn = tmp_path / "catalog_blinding.npy"
+    generate_catalog_parameters(
+        parameters_fn=legacy_fn,
+        w0=-0.99,
+        wa=0.05,
+        fnl_blind=7.0,
+        validate=False,
+        overwrite=True,
+    )
+    generate_catalog_parameters(
+        parameters_fn=generic_fn,
+        w0=-0.98,
+        wa=0.04,
+        fnl_blind=6.0,
+        validate=False,
+        overwrite=True,
+    )
+
+    params = TracerCatalogBlinder.load_parameters(
+        modes=["bao", "fnl"],
+        save_dir=tmp_path,
+        metadata="sealed",
+        validate=False,
+    )
+    assert params["parameters_fn"] == str(generic_fn)
+    assert params["w0"] == pytest.approx(-0.98)
+    assert params["fnl_blind"] == pytest.approx(6.0)
 
 
 def test_catalog_metadata_and_output_suffix_do_not_expose_sealed_values(tmp_path):
@@ -108,8 +176,92 @@ def test_bao_redshift_remapping_matches_direct_cosmoprimo():
     expected[mask] = DistanceToRedshift(cosmo_fid.comoving_radial_distance)(
         cosmo_blind.comoving_radial_distance(expected[mask])
     )
+    actual = TracerCatalogBlinder.transform_redshift(catalog["Z"], w0=params["w0"], wa=params["wa"])
+    np.testing.assert_allclose(actual[mask], expected[mask], rtol=0, atol=1e-12)
     assert np.allclose(blinded["Z"][mask], expected[mask])
     assert np.isnan(blinded["Z"][-1])
+
+
+def test_bao_redshift_transform_inverse_and_scalar():
+    pytest.importorskip("cosmoprimo")
+
+    z = np.array([0.4, 0.8, 1.1, np.nan])
+    blinded = TracerCatalogBlinder.transform_redshift(z, w0=-0.99, wa=0.05)
+    assert blinded.shape == z.shape
+    assert not np.allclose(blinded[:-1], z[:-1])
+    assert np.isnan(blinded[-1])
+
+    unblinded = TracerCatalogBlinder.transform_redshift(blinded, w0=-0.99, wa=0.05, inverse=True)
+    np.testing.assert_allclose(unblinded[:-1], z[:-1], rtol=0, atol=1e-8)
+    assert np.isnan(unblinded[-1])
+
+    scalar = TracerCatalogBlinder.transform_redshift(0.8, w0=-0.99, wa=0.05)
+    assert isinstance(scalar, float)
+
+
+def test_bao_redshift_remapping_supports_input_and_output_columns():
+    pytest.importorskip("cosmoprimo")
+
+    catalog = ToyCatalog(
+        Z=np.array([0.41, 0.81, 1.11]),
+        Z_not4clus=np.array([0.4, 0.8, 1.1]),
+    )
+    params = {
+        "modes": ("bao",),
+        "w0": -0.99,
+        "wa": 0.05,
+        "metadata": "sealed",
+        "parameter_mode": "secret_file",
+        "parameters_fn": "catalog.npy",
+        "parameters_key": "hidden",
+    }
+    blinded = TracerCatalogBlinder.apply_bao_blinding(
+        catalog,
+        params,
+        input_zcol="Z_not4clus",
+        output_zcol="Z",
+    )
+
+    expected = TracerCatalogBlinder.transform_redshift(catalog["Z_not4clus"], w0=params["w0"], wa=params["wa"])
+    np.testing.assert_allclose(blinded["Z"], expected, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(blinded["Z_not4clus"], catalog["Z_not4clus"])
+    assert not np.allclose(blinded["Z"], catalog["Z"])
+
+
+def test_bao_redshift_remapping_accepts_direct_parameters_and_alias_modes():
+    pytest.importorskip("cosmoprimo")
+
+    catalog = ToyCatalog(Z=np.array([0.4, 0.8, 1.1]))
+    params = {"modes": ("ap",), "w0": -0.99, "wa": 0.05}
+    blinded = TracerCatalogBlinder.apply_bao_blinding(catalog, params)
+    expected = TracerCatalogBlinder.apply_bao_blinding(catalog, {"w0": -0.99, "wa": 0.05})
+
+    np.testing.assert_allclose(blinded["Z"], expected["Z"], rtol=0, atol=1e-12)
+    assert blinded.attrs["catalog_blinding"] == "bao"
+    assert "catalog_blinding_parameters_file" not in expected.attrs
+
+
+def test_bao_blinding_removal_requires_force_and_roundtrips():
+    pytest.importorskip("cosmoprimo")
+
+    catalog = ToyCatalog(Z=np.array([0.4, 0.8, 1.1, np.nan]))
+    params = {
+        "modes": ("bao",),
+        "w0": -0.99,
+        "wa": 0.05,
+        "metadata": "sealed",
+        "parameter_mode": "secret_file",
+        "parameters_fn": "catalog.npy",
+        "parameters_key": "hidden",
+    }
+    with pytest.raises(ValueError, match="force=True"):
+        TracerCatalogBlinder.remove_bao_blinding(catalog, params)
+
+    blinded = TracerCatalogBlinder.apply_bao_blinding(catalog, params)
+    unblinded = TracerCatalogBlinder.remove_bao_blinding(blinded, params, force=True)
+    mask = np.isfinite(catalog["Z"])
+    np.testing.assert_allclose(unblinded["Z"][mask], catalog["Z"][mask], rtol=0, atol=1e-8)
+    assert np.isnan(unblinded["Z"][-1])
 
 
 def test_rsd_and_fnl_delegate_to_mockfactory(monkeypatch):

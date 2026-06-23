@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import logging
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +20,8 @@ from .data_vector import SHIFTS_DIR
 
 logger = logging.getLogger("desiblind.catalog")
 
-CATALOG_PARAMETERS_FILENAME = "catalog_blinding_2026_06.npy"
+CATALOG_PARAMETERS_FILENAME = "catalog_blinding.npy"
+LEGACY_CATALOG_PARAMETERS_FILENAMES = ("catalog_blinding_2026_06.npy",)
 CATALOG_INTERNAL_NAME = "catalog_blinding"
 DEFAULT_AP_ZRANGE = (0.1, 2.1)
 DEFAULT_AP_MAX_SHIFT = 0.03
@@ -290,12 +292,14 @@ def generate_catalog_parameters(
 class TracerCatalogBlinder:
     """Apply DESI catalog-level blinding to in-memory catalog objects.
 
-    No catalog-level unblinding helper is provided:
-    regenerate from the original catalogs instead.
+    BAO/AP redshift remapping has an inverse helper for validation. RSD and
+    fNL catalog-level blinding are apply-only; regenerate from the original
+    catalogs instead.
     """
 
     blinded_nmax = 100
     parameters_filename = CATALOG_PARAMETERS_FILENAME
+    legacy_parameters_filenames = LEGACY_CATALOG_PARAMETERS_FILENAMES
 
     @classmethod
     def _get_bid(cls):
@@ -309,6 +313,17 @@ class TracerCatalogBlinder:
         if save_dir is None:
             save_dir = SHIFTS_DIR
         return Path(save_dir) / cls.parameters_filename
+
+    @classmethod
+    def _find_legacy_parameters_fn(cls, save_dir=None):
+        if save_dir is None:
+            save_dir = SHIFTS_DIR
+        save_dir = Path(save_dir)
+        for filename in cls.legacy_parameters_filenames:
+            fn = save_dir / filename
+            if fn.exists():
+                return fn
+        return None
 
     @classmethod
     def get_blinding_modes(cls, modes):
@@ -325,6 +340,16 @@ class TracerCatalogBlinder:
     @classmethod
     def _load_secret_candidate(cls, save_dir=None, parameters_fn=None):
         fn = cls.get_parameters_fn(save_dir=save_dir, parameters_fn=parameters_fn)
+        if parameters_fn is None and not fn.exists():
+            legacy_fn = cls._find_legacy_parameters_fn(save_dir=save_dir)
+            if legacy_fn is not None:
+                warnings.warn(
+                    f"Loading legacy catalog blinding parameter file {legacy_fn.name!r}. "
+                    f"Pass parameters_fn explicitly or rename/copy it to {cls.parameters_filename!r}.",
+                    FutureWarning,
+                    stacklevel=2,
+                )
+                fn = legacy_fn
         candidates = np.load(fn, allow_pickle=True).item()
         bid = cls._get_bid()
         key = _catalog_parameter_key(bid)
@@ -422,13 +447,16 @@ class TracerCatalogBlinder:
         """Return attrs to attach to blinded catalogs and measurements."""
         if not params:
             return {}
+        modes = cls.get_blinding_modes(params.get("modes", ("bao",)))
         attrs = {
-            "catalog_blinding": ",".join(params["modes"]),
+            "catalog_blinding": ",".join(modes),
             "catalog_blinding_parameter_mode": params.get("parameter_mode", "secret_file"),
             "catalog_blinding_metadata": params.get("metadata", "sealed"),
-            "catalog_blinding_parameters_file": Path(params["parameters_fn"]).name,
-            "catalog_blinding_parameters_key": hashlib.sha256(params["parameters_key"].encode()).hexdigest()[:16],
         }
+        if params.get("parameters_fn", None):
+            attrs["catalog_blinding_parameters_file"] = Path(params["parameters_fn"]).name
+        if params.get("parameters_key", None):
+            attrs["catalog_blinding_parameters_key"] = hashlib.sha256(params["parameters_key"].encode()).hexdigest()[:16]
         if params.get("parameters_file_sha256", None):
             attrs["catalog_blinding_parameters_file_sha256"] = params["parameters_file_sha256"][:16]
         if params.get("metadata", "sealed") == "open":
@@ -485,30 +513,172 @@ class TracerCatalogBlinder:
             catalog.attrs.update(attrs)
         return catalog
 
+    @staticmethod
+    def _get_fiducial_cosmology(cosmo_fid="DESI"):
+        if isinstance(cosmo_fid, str):
+            if cosmo_fid != "DESI":
+                raise ValueError(f"Unknown fiducial cosmology {cosmo_fid!r}; pass a cosmology object instead.")
+            from cosmoprimo.fiducial import DESI
+
+            return DESI()
+        return cosmo_fid
+
     @classmethod
-    def apply_bao_blinding(cls, catalog, params, zcol="Z"):
-        """Apply AP/BAO redshift remapping to one raw catalog."""
-        if not params or "bao" not in params["modes"]:
-            return catalog
-        from cosmoprimo.fiducial import DESI
+    def transform_redshift(cls, z, w0, wa, cosmo_fid="DESI", inverse=False):
+        """Return BAO/AP-remapped redshifts for a blinded ``w0``/``wa`` cosmology."""
         from cosmoprimo.utils import DistanceToRedshift
 
-        cosmo_fid = DESI()
-        cosmo_blind = cosmo_fid.clone(w0_fld=params["w0"], wa_fld=params["wa"])
-        z = np.asarray(catalog[zcol])
-        z_shift = z.copy()
-        mask = np.isfinite(z)
-        z_shift[mask] = DistanceToRedshift(cosmo_fid.comoving_radial_distance)(
-            cosmo_blind.comoving_radial_distance(z[mask])
-        )
-        return cls._with_attrs(cls._copy_catalog_with_attrs(catalog, **{zcol: z_shift}), params)
+        cosmo_fid = cls._get_fiducial_cosmology(cosmo_fid=cosmo_fid)
+        cosmo_blind = cosmo_fid.clone(w0_fld=float(w0), wa_fld=float(wa))
+
+        scalar = np.ndim(z) == 0
+        zin = np.asarray(z, dtype="f8")
+        zout = zin.copy()
+        mask = np.isfinite(zin)
+        if np.any(mask):
+            if inverse:
+                distance = cosmo_fid.comoving_radial_distance(zin[mask])
+                zout[mask] = DistanceToRedshift(cosmo_blind.comoving_radial_distance)(distance)
+            else:
+                distance = cosmo_blind.comoving_radial_distance(zin[mask])
+                zout[mask] = DistanceToRedshift(cosmo_fid.comoving_radial_distance)(distance)
+        if scalar:
+            return float(zout)
+        return zout
 
     @classmethod
-    def apply_bao_blinding_to_catalogs(cls, catalogs, params, zcol="Z"):
+    def _require_bao_parameters(cls, params):
+        if not params:
+            return None
+        modes = params.get("modes", None)
+        if modes is not None and "bao" not in cls.get_blinding_modes(modes):
+            return None
+        missing = [name for name in ["w0", "wa"] if name not in params]
+        if missing:
+            raise ValueError(f"Catalog BAO blinding parameters missing required key(s): {missing}.")
+        return params
+
+    @classmethod
+    def _apply_bao_redshift_transform(
+        cls,
+        catalog,
+        params,
+        zcol="Z",
+        input_zcol=None,
+        output_zcol=None,
+        copy=True,
+        inverse=False,
+    ):
+        input_zcol = zcol if input_zcol is None else input_zcol
+        output_zcol = zcol if output_zcol is None else output_zcol
+        z_shift = cls.transform_redshift(catalog[input_zcol], w0=params["w0"], wa=params["wa"], inverse=inverse)
+        if copy:
+            new = cls._copy_catalog_with_attrs(catalog, **{output_zcol: z_shift})
+        else:
+            new = catalog
+            new[output_zcol] = z_shift
+        return cls._with_attrs(new, params)
+
+    @classmethod
+    def apply_bao_blinding(cls, catalog, params, zcol="Z", input_zcol=None, output_zcol=None, copy=True):
+        """Apply AP/BAO redshift remapping to one raw catalog."""
+        params = cls._require_bao_parameters(params)
+        if params is None:
+            return catalog
+        return cls._apply_bao_redshift_transform(
+            catalog,
+            params,
+            zcol=zcol,
+            input_zcol=input_zcol,
+            output_zcol=output_zcol,
+            copy=copy,
+        )
+
+    @classmethod
+    def apply_bao_blinding_to_catalogs(cls, catalogs, params, zcol="Z", input_zcol=None, output_zcol=None, copy=True):
         """Apply AP/BAO redshift remapping to one catalog or a list of catalogs."""
         if isinstance(catalogs, (list, tuple)):
-            return [cls.apply_bao_blinding(catalog, params, zcol=zcol) for catalog in catalogs]
-        return cls.apply_bao_blinding(catalogs, params, zcol=zcol)
+            return [
+                cls.apply_bao_blinding(
+                    catalog,
+                    params,
+                    zcol=zcol,
+                    input_zcol=input_zcol,
+                    output_zcol=output_zcol,
+                    copy=copy,
+                )
+                for catalog in catalogs
+            ]
+        return cls.apply_bao_blinding(
+            catalogs,
+            params,
+            zcol=zcol,
+            input_zcol=input_zcol,
+            output_zcol=output_zcol,
+            copy=copy,
+        )
+
+    @classmethod
+    def remove_bao_blinding(
+        cls,
+        catalog,
+        params,
+        zcol="Z",
+        input_zcol=None,
+        output_zcol=None,
+        copy=True,
+        force=False,
+    ):
+        """Remove AP/BAO redshift remapping from one raw catalog."""
+        if not force:
+            raise ValueError('Are you sure you want to unblind? If so, provide "force=True"')
+        params = cls._require_bao_parameters(params)
+        if params is None:
+            return catalog
+        return cls._apply_bao_redshift_transform(
+            catalog,
+            params,
+            zcol=zcol,
+            input_zcol=input_zcol,
+            output_zcol=output_zcol,
+            copy=copy,
+            inverse=True,
+        )
+
+    @classmethod
+    def remove_bao_blinding_from_catalogs(
+        cls,
+        catalogs,
+        params,
+        zcol="Z",
+        input_zcol=None,
+        output_zcol=None,
+        copy=True,
+        force=False,
+    ):
+        """Remove AP/BAO redshift remapping from one catalog or a list of catalogs."""
+        if isinstance(catalogs, (list, tuple)):
+            return [
+                cls.remove_bao_blinding(
+                    catalog,
+                    params,
+                    zcol=zcol,
+                    input_zcol=input_zcol,
+                    output_zcol=output_zcol,
+                    copy=copy,
+                    force=force,
+                )
+                for catalog in catalogs
+            ]
+        return cls.remove_bao_blinding(
+            catalogs,
+            params,
+            zcol=zcol,
+            input_zcol=input_zcol,
+            output_zcol=output_zcol,
+            copy=copy,
+            force=force,
+        )
 
     @staticmethod
     def _positions_to_rdz(positions):
@@ -614,8 +784,8 @@ def _parse_rows(rows):
 
 def collect_argparser():
     parser = argparse.ArgumentParser(description="Generate DESI catalog-level blinding secret parameters.")
-    parser.add_argument("--parameters-fn", default=None, help="Output .npy filename.")
-    parser.add_argument("--save-dir", default=None, help="Directory for the default catalog blinding filename.")
+    parser.add_argument("--parameters-fn", default=None, help="Explicit .npy parameter filename; recommended for production.")
+    parser.add_argument("--save-dir", default=None, help=f"Directory for the generic default {CATALOG_PARAMETERS_FILENAME}.")
     parser.add_argument("--w0", type=float, default=None, help="Explicit global w0 value.")
     parser.add_argument("--wa", type=float, default=None, help="Explicit global wa value.")
     parser.add_argument("--fnl-blind", type=float, default=None, help="Explicit global fNL value.")
