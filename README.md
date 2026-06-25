@@ -32,10 +32,10 @@ source /global/common/software/desi/users/adematti/cosmodesi_environment.sh main
 ## Catalog-level BAO/AP blinding
 
 `desiblind` also provides a generic BAO/AP catalog-level redshift remapping API.
-Pipeline packages such as `desi-clustering` should still handle DESI catalog
-file discovery, `LSScats/` naming, region splitting, and job orchestration; the
-catalog blinder only handles the generic blinding transformation and private
-hash-key parameter-bank convention.
+DESI pipeline code or validation drivers should still handle catalog file
+discovery, `LSScats/` naming, region splitting, and job orchestration; the
+catalog blinder only handles the generic redshift-remapping transformation and
+private hash-key parameter-bank convention.
 
 ```python
 from desiblind import CatalogBAOBlinder
@@ -61,19 +61,90 @@ CatalogBAOBlinder.write_blinded_parameters('LRG3', params, save_dir='private')
 params = CatalogBAOBlinder.load_blinded_parameters('LRG3', save_dir='private')
 ```
 
-Validation is split into two levels:
+Validation is organized by LSS workflow step, because LSS is the
+reference implementation for catalog-level blinding:
 
-1. Core redshift-remapping equivalence with
+1. Redshift-shift equivalence with
    `LSS.blinding_tools.apply_zshift_DE`. This is covered by the lightweight
    `tests/test_catalog.py` test that compares the cosmology formula directly.
-2. Full LSS workflow equivalence. This still needs to be run before production
-   use, because the LSS script applies BAO/AP blinding to `Z_not4clus`, clips
-   that input redshift column, recomputes `n(z)`, rescales `WEIGHT_SYS`, and
-   then builds clustering data/random catalogs.
+   On NERSC, the same comparison can be run against the actual LSS function and
+   a small real-catalog sample with:
+
+   ```bash
+   python scripts/validation/validate_catalog_bao_lss_redshift_shift.py
+   ```
+
+2. LSS `n(z)` / `WEIGHT_SYS` compatibility after replacing only the redshift
+   shifter with `CatalogBAOBlinder`:
+
+   ```bash
+   python scripts/validation/validate_catalog_bao_lss_nz_weight.py
+   ```
+
+3. LSS-style saved full-catalog BAO/AP workflow through `WEIGHT_FKP`, shifted
+   saved `Z`, output `n(z)`, and final `WEIGHT_SYS` update:
+
+   ```bash
+   python scripts/validation/validate_catalog_bao_lss_saved_catalog.py
+   ```
+
+4. LSS `mkclusdat` clustering-data generation from the saved blinded full
+   catalog:
+
+   ```bash
+   python scripts/validation/validate_catalog_bao_lss_mkclusdat.py
+   ```
+
+5. LSS `mkclusran` clustering-random generation from the blinded clustering
+   data catalog and a scratch random sample:
+
+   ```bash
+   python scripts/validation/validate_catalog_bao_lss_mkclusran.py
+   ```
+
+6. LSS Galactic-cap splitting for the blinded clustering data and random
+   catalogs:
+
+   ```bash
+   python scripts/validation/validate_catalog_bao_lss_split_gc.py
+   ```
+
+   These validation scripts write only to fresh directories under `$SCRATCH` by
+   default.
+
+The validation suite now covers the BAO/AP saved-catalog path through the same
+LSS data/random catalog production steps. Detailed commands, NERSC interactive
+examples, exact comparison definitions, and current production-like reference
+outputs are documented in:
+
+```text
+scripts/validation/README.md
+```
+
+A rendered validation walkthrough notebook with the full validation ladder, exact
+input/output file pairs, HDF5 comparisons, native smoke tests, Pk plots over the BAO-range k grid, final xi plots out to s=200, built-in xi multipoles, and pair-count residual plots is
+available at:
+
+```text
+scripts/validation/catalog_bao_validation.ipynb
+```
+
+The rendered notebook uses BAO-range validation products for the plots: Pk with `meshsize=256`, `boxsize=6000`, `kmax=0.13`, `dk=0.005`, and xi with `smax=200`, `ds=5`, `nmu=40`. The Pk plot summary is `/pscratch/sd/u/uendert/desiblind_lss_validation/desi-clustering-pk-bao-validated-20260625T130130Z/summary.json`; the xi plot summary is `/pscratch/sd/u/uendert/desiblind_lss_validation/desi-clustering-xi-wide-20260625T114027Z/summary.json`.
+
+Remaining work before production use includes optional random resampling modes
+and any additional production packaging requested by the collaboration. The
+catalog-level blinding machinery and validation should stay in `desiblind`; a
+measurement pipeline such as `desi-clustering` should either read saved blinded
+catalogs as normal inputs or keep only a narrow measurement-side bridge to
+`CatalogBAOBlinder`. Future RSD and fNL catalog blinding should be treated as
+saved-catalog workflows, not generic on-the-fly measurement options, because
+they require reconstruction and heavier LSS processing.
 
 ## Examples
 
-See `nb/blinding_example_new.ipynb` for an up-to-date example of the API functionality.
+See `nb/blinding_example_new.ipynb` for data-vector power-spectrum/bispectrum
+examples, and `nb/catalog_bao_blinding_example.ipynb` for the catalog-level
+BAO/AP redshift-remapping API.
 
 ## Credits
 
