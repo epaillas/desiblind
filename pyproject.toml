@@ -20,9 +20,10 @@ classifiers = ["Programming Language :: Python :: 3"]
 [project.optional-dependencies]
 catalog = [
     "cosmoprimo",
+    "jax-power @ git+https://github.com/adematti/jax-power",
+    "jax-recon @ git+https://github.com/adematti/jax-recon",
     "mockfactory",
     "mpi4py",
-    "pyrecon",
     "PyYAML",
 ]
 

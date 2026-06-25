@@ -1,9 +1,11 @@
+import builtins
 import sys
 import types
 
 import numpy as np
 import pytest
 
+import desiblind.catalog as catalog_module
 from desiblind.catalog import (
     TracerCatalogBlinder,
     _catalog_parameter_key,
@@ -264,7 +266,62 @@ def test_bao_blinding_removal_requires_force_and_roundtrips():
     assert np.isnan(unblinded["Z"][-1])
 
 
-def test_rsd_and_fnl_delegate_to_mockfactory(monkeypatch):
+def _make_jax_blinding_case():
+    from cosmoprimo.fiducial import DESI
+    from mockfactory import Catalog
+
+    z, bias, seed = 1.0, 2.0, 11
+    cosmo = DESI()
+    fourier = cosmo.get_fourier()
+    f_fid = fourier.sigma8_z(z, of="theta_cb") / fourier.sigma8_z(z, of="delta_cb")
+    fgrowth_blind = 0.8 * f_fid
+    fnl_blind = 10.0
+
+    rng = np.random.RandomState(seed)
+    boxcenter = np.array([0.0, 0.0, cosmo.comoving_radial_distance(z)])
+    data_positions = rng.uniform(-50.0, 50.0, size=(300, 3)) + boxcenter
+    randoms_positions = rng.uniform(-50.0, 50.0, size=(1500, 3)) + boxcenter
+    data_weights = np.clip(1.0 + 0.1 * rng.normal(size=len(data_positions)), 0.5, 1.5)
+    randoms_weights = np.ones(len(randoms_positions))
+    mesh_kwargs = {"nmesh": 24, "boxsize": 140.0, "boxcenter": boxcenter}
+
+    data = Catalog(
+        {
+            "POSITION": data_positions,
+            "INDWEIGHT": data_weights,
+            "RA": np.zeros(len(data_positions)),
+            "DEC": np.zeros(len(data_positions)),
+            "Z": np.zeros(len(data_positions)),
+        }
+    )
+    randoms = [
+        Catalog(
+            {
+                "POSITION": randoms_positions,
+                "INDWEIGHT": randoms_weights,
+            }
+        )
+    ]
+    params = {
+        "modes": ("rsd", "fnl"),
+        "fgrowth_blind": fgrowth_blind,
+        "fnl_blind": fnl_blind,
+        "metadata": "sealed",
+        "parameter_mode": "secret_file",
+        "parameters_fn": "catalog.npy",
+        "parameters_key": "hidden",
+        "options": {
+            "zeff": z,
+            "bias": bias,
+            "rsd_kwargs": dict(mesh_kwargs),
+            "fnl_kwargs": dict(mesh_kwargs),
+            "fnl_shotnoise_correction": True,
+        },
+    }
+    return cosmo, data, randoms, params, mesh_kwargs
+
+
+def test_rsd_and_fnl_use_desiblind_jax_helpers_not_mockfactory_blinding(monkeypatch):
     calls = []
 
     class FakeDESI:
@@ -281,18 +338,6 @@ def test_rsd_and_fnl_delegate_to_mockfactory(monkeypatch):
                 POSITION=np.concatenate([catalog["POSITION"] for catalog in catalogs]),
                 INDWEIGHT=np.concatenate([catalog["INDWEIGHT"] for catalog in catalogs]),
             )
-
-    class FakeCutskyCatalogBlinding:
-        def __init__(self, **kwargs):
-            calls.append(("init", kwargs))
-
-        def rsd(self, positions, **kwargs):
-            calls.append(("rsd", kwargs))
-            return positions + 1.0
-
-        def png(self, positions, **kwargs):
-            calls.append(("png", kwargs))
-            return kwargs["data_weights"] * 2.0
 
     def cartesian_to_sky(positions):
         distance = np.sqrt(np.sum(positions**2, axis=1))
@@ -313,14 +358,29 @@ def test_rsd_and_fnl_delegate_to_mockfactory(monkeypatch):
     mockfactory = types.ModuleType("mockfactory")
     mockfactory.Catalog = FakeCatalogOps
     mockfactory.cartesian_to_sky = cartesian_to_sky
-    mockfactory_blinding = types.ModuleType("mockfactory.blinding")
-    mockfactory_blinding.CutskyCatalogBlinding = FakeCutskyCatalogBlinding
+
+    def fake_rsd_blinding(data_positions, data_weights=None, randoms_positions=None, randoms_weights=None, **kwargs):
+        calls.append(("rsd", kwargs, data_weights, randoms_positions, randoms_weights))
+        return data_positions + 1.0
+
+    def fake_fnl_blinding(data_positions, data_weights=None, randoms_positions=None, randoms_weights=None, **kwargs):
+        calls.append(("fnl", kwargs, data_weights, randoms_positions, randoms_weights))
+        return data_weights * 2.0
+
+    real_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "mockfactory.blinding" or name.startswith("mockfactory.blinding."):
+            raise AssertionError("production catalog blinding must not import mockfactory.blinding")
+        return real_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setitem(sys.modules, "cosmoprimo", cosmoprimo)
     monkeypatch.setitem(sys.modules, "cosmoprimo.fiducial", fiducial)
     monkeypatch.setitem(sys.modules, "cosmoprimo.utils", utils)
     monkeypatch.setitem(sys.modules, "mockfactory", mockfactory)
-    monkeypatch.setitem(sys.modules, "mockfactory.blinding", mockfactory_blinding)
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.setattr(catalog_module, "_apply_rsd_jax_blinding", fake_rsd_blinding)
+    monkeypatch.setattr(catalog_module, "_apply_fnl_jax_blinding", fake_fnl_blinding)
 
     data = ToyCatalog(
         POSITION=np.ones((2, 3)),
@@ -348,10 +408,97 @@ def test_rsd_and_fnl_delegate_to_mockfactory(monkeypatch):
     assert np.allclose(weighted["INDWEIGHT"], data["INDWEIGHT"] * 2.0)
     assert np.allclose(weighted["WEIGHT_BLIND"], 2.0)
     assert returned_randoms is randoms
+    assert calls[0][0] == "rsd"
     assert calls[0][1]["bias"] == pytest.approx(2.1)
     assert calls[0][1]["z"] == pytest.approx(0.9)
-    assert calls[1][0] == "rsd"
-    assert calls[1][1]["smoothing_radius"] == pytest.approx(12.0)
-    assert calls[3][0] == "png"
-    assert calls[3][1]["method"] == "data_weights"
-    assert calls[3][1]["smoothing_radius"] == pytest.approx(25.0)
+    assert calls[0][1]["recon"] == "IterativeFFTReconstruction"
+    assert calls[0][1]["smoothing_radius"] == pytest.approx(12.0)
+    assert calls[1][0] == "fnl"
+    assert calls[1][1]["method"] == "data_weights"
+    assert calls[1][1]["smoothing_radius"] == pytest.approx(25.0)
+
+
+def test_jax_rsd_and_fnl_match_mockfactory_reference():
+    from jax import config
+
+    config.update("jax_enable_x64", True)
+    pytest.importorskip("jaxrecon")
+    pytest.importorskip("jaxpower")
+    pytest.importorskip("mockfactory")
+    from cosmoprimo.fiducial import DESI
+    from mockfactory import Catalog
+    from mockfactory.blinding import CutskyCatalogBlinding
+
+    cosmo, data, randoms, params, mesh_kwargs = _make_jax_blinding_case()
+    options = params["options"]
+    crandoms = Catalog.concatenate(randoms)
+
+    cosmo_blind = DESI()
+    cosmo_blind._derived["f"] = params["fgrowth_blind"]
+    cosmo_blind._derived["fnl"] = params["fnl_blind"]
+    reference = CutskyCatalogBlinding(
+        cosmo_fid=cosmo,
+        cosmo_blind=cosmo_blind,
+        bias=options["bias"],
+        z=options["zeff"],
+        position_type="pos",
+        mpicomm=data.mpicomm,
+    )
+
+    expected_positions = reference.rsd(
+        data["POSITION"],
+        data_weights=data["INDWEIGHT"],
+        randoms_positions=crandoms["POSITION"],
+        randoms_weights=crandoms["INDWEIGHT"],
+        smoothing_radius=options.get("rsd_smoothing_radius", 15.0),
+        **mesh_kwargs,
+    )
+    actual_rsd = TracerCatalogBlinder.apply_rsd_blinding(data, randoms, params, tracer="LRG")
+    np.testing.assert_allclose(actual_rsd["POSITION"], expected_positions, rtol=1e-10, atol=1e-10)
+
+    expected_weights = reference.png(
+        data["POSITION"],
+        data_weights=data["INDWEIGHT"],
+        randoms_positions=crandoms["POSITION"],
+        randoms_weights=crandoms["INDWEIGHT"],
+        method="data_weights",
+        shotnoise_correction=options["fnl_shotnoise_correction"],
+        smoothing_radius=options.get("fnl_smoothing_radius", 30.0),
+        **mesh_kwargs,
+    )
+    actual_fnl, returned_randoms = TracerCatalogBlinder.apply_fnl_blinding(data, randoms, params, tracer="LRG")
+    np.testing.assert_allclose(actual_fnl["INDWEIGHT"], expected_weights, rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(actual_fnl["WEIGHT_BLIND"], expected_weights / data["INDWEIGHT"], rtol=1e-10, atol=1e-10)
+    assert returned_randoms is randoms
+
+
+def test_plane_parallel_reconstruction_blinding_smoke():
+    from jax import config
+
+    config.update("jax_enable_x64", True)
+    pytest.importorskip("jaxrecon")
+    pytest.importorskip("jaxpower")
+    pytest.importorskip("mockfactory")
+
+    cosmo, data, randoms, params, mesh_kwargs = _make_jax_blinding_case()
+    del cosmo
+    params["options"]["rsd_recon"] = "PlaneParallelFFTReconstruction"
+    params["options"]["rsd_kwargs"] = dict(mesh_kwargs, los="z")
+    params["options"]["fnl_recon"] = "PlaneParallelFFTReconstruction"
+    params["options"]["fnl_kwargs"] = dict(mesh_kwargs, los="z")
+
+    rsd_data = TracerCatalogBlinder.apply_rsd_blinding(data, randoms, params, tracer="LRG")
+    assert rsd_data["POSITION"].shape == data["POSITION"].shape
+    assert np.all(np.isfinite(rsd_data["POSITION"]))
+
+    fnl_data, returned_randoms = TracerCatalogBlinder.apply_fnl_blinding(data, randoms, params, tracer="LRG")
+    assert fnl_data["INDWEIGHT"].shape == data["INDWEIGHT"].shape
+    assert np.all(np.isfinite(fnl_data["INDWEIGHT"]))
+    assert returned_randoms is randoms
+
+
+def test_invalid_reconstruction_name_raises():
+    pytest.importorskip("jaxrecon")
+
+    with pytest.raises(ValueError, match="Unknown jax-recon reconstruction"):
+        catalog_module._get_reconstruction_class("NotAReconstruction")

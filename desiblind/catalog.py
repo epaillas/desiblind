@@ -35,6 +35,7 @@ LSS_DEFAULT_BIAS = {"BGS": 1.8, "LRG": 2.0, "LGE": 2.0, "ELG": 1.3, "QSO": 2.3}
 
 
 def _make_tuple(value):
+    """Return ``value`` as a tuple while treating strings as atomic values."""
     if value is None:
         return ()
     if isinstance(value, str):
@@ -79,10 +80,12 @@ def _simple_tracer(tracer):
 
 
 def _catalog_parameter_key(bid):
+    """Return the hidden dictionary key for one catalog-blinding realization."""
     return hashlib.sha256(f"{CATALOG_INTERNAL_NAME}_bid{int(bid)}".encode()).hexdigest()
 
 
 def _load_w0wa_table(w0wa_table):
+    """Load a text table whose first two columns are ``w0`` and ``wa``."""
     table = np.loadtxt(w0wa_table)
     table = np.asarray(table)
     if table.ndim != 2 or table.shape[1] < 2:
@@ -91,6 +94,7 @@ def _load_w0wa_table(w0wa_table):
 
 
 def _ap_shift_summary(w0, wa, zrange=DEFAULT_AP_ZRANGE, nz=256):
+    """Summarize AP scaling shifts for one candidate dark-energy model."""
     from cosmoprimo.fiducial import DESI
 
     z = np.linspace(float(zrange[0]), float(zrange[1]), int(nz))
@@ -154,6 +158,466 @@ def compute_fgrowth_blind(
     return float(f_shift)
 
 
+def _get_from_cosmo(cosmo, name, z=None):
+    """Return a scalar cosmological quantity, including derived f/fNL values."""
+
+    def check_z():
+        """Require an explicit redshift for redshift-dependent quantities."""
+        if z is None:
+            raise ValueError("z is None.")
+
+    if name.startswith("omega"):
+        return _get_from_cosmo(cosmo, "O" + name[1:], z=z) * cosmo.h**2
+    if name.startswith("Omega"):
+        if z is None:
+            name = name[:5] + "0" + name[5:]
+            return getattr(cosmo, name)
+        check_z()
+        return getattr(cosmo, name)(z)
+    if name in getattr(cosmo, "_derived", {}):
+        return cosmo._derived[name]
+    if name == "fsigma8":
+        check_z()
+        return cosmo.get_fourier().sigma8_z(z, of="theta_cb")
+    if name == "sigma8":
+        check_z()
+        return cosmo.get_fourier().sigma8_z(z, of="delta_cb")
+    if name == "f":
+        return _get_from_cosmo(cosmo, "fsigma8", z=z) / _get_from_cosmo(cosmo, "sigma8", z=z)
+    if name == "fnl":
+        return 0.0
+    return getattr(cosmo, name)
+
+
+def _pop_recon_kwargs(kwargs, default_cellsize):
+    """Split user reconstruction options into mesh and jax-recon keywords."""
+    kwargs = dict(kwargs)
+    if not any(name in kwargs for name in ["nmesh", "meshsize", "cellsize"]):
+        kwargs["cellsize"] = default_cellsize
+
+    mesh_kwargs = {}
+    if "nmesh" in kwargs:
+        mesh_kwargs["meshsize"] = kwargs.pop("nmesh")
+    for name in [
+        "meshsize",
+        "boxsize",
+        "boxcenter",
+        "cellsize",
+        "boxpad",
+        "check",
+        "approximate",
+        "dtype",
+        "primes",
+        "divisors",
+        "sharding_mesh",
+        "fft_backend",
+    ]:
+        if name in kwargs:
+            mesh_kwargs[name] = kwargs.pop(name)
+
+    recon_kwargs = {}
+    for name, default in [
+        ("los", None),
+        ("resampler", "cic"),
+        ("halo_add", 0),
+        ("threshold_randoms", ("noise", 0.01)),
+        ("niterations", 3),
+    ]:
+        recon_kwargs[name] = kwargs.pop(name, default)
+
+    if kwargs:
+        raise TypeError(f"Unknown reconstruction keyword argument(s): {', '.join(sorted(kwargs))}")
+    return mesh_kwargs, recon_kwargs
+
+
+def _get_reconstruction_class(recon):
+    """Return a jax-recon reconstruction class from a class or class name."""
+    from jaxrecon import zeldovich
+
+    if not isinstance(recon, str):
+        return recon
+    try:
+        return getattr(zeldovich, recon)
+    except AttributeError as exc:
+        raise ValueError(f"Unknown jax-recon reconstruction {recon!r}.") from exc
+
+
+def _gather_to_all(array, mpicomm=None):
+    """Gather an MPI-scattered array and broadcast the gathered copy."""
+    if array is None or mpicomm is None or getattr(mpicomm, "size", 1) == 1:
+        return array
+    import mpytools as mpy
+
+    array = mpy.gather(array, mpicomm=mpicomm, mpiroot=0)
+    if mpicomm.rank == 0:
+        array = np.asarray(array)
+    return mpicomm.bcast(array, root=0)
+
+
+def _make_particle_field(positions, weights=None, attrs=None, mpicomm=None):
+    """Build a jaxpower particle field after gathering MPI-scattered arrays."""
+    from jaxpower import ParticleField
+
+    positions = _gather_to_all(positions, mpicomm=mpicomm)
+    weights = _gather_to_all(weights, mpicomm=mpicomm)
+    return ParticleField(positions, weights, attrs=attrs)
+
+
+def _build_reconstruction(
+    data_positions,
+    data_weights=None,
+    randoms_positions=None,
+    randoms_weights=None,
+    f=None,
+    bias=None,
+    smoothing_radius=15.0,
+    dtype=None,
+    mpicomm=None,
+    default_cellsize=7.0,
+    recon="IterativeFFTReconstruction",
+    **kwargs,
+):
+    """Build the jax-recon object and mesh attributes used by RSD/fNL blinding."""
+    from jaxpower import FKPField, get_mesh_attrs
+
+    reconstruction_algorithm = _get_reconstruction_class(recon)
+    mesh_kwargs, recon_kwargs = _pop_recon_kwargs(kwargs, default_cellsize=default_cellsize)
+    if dtype is not None:
+        mesh_kwargs.setdefault("dtype", dtype)
+
+    data_positions_all = _gather_to_all(data_positions, mpicomm=mpicomm)
+    randoms_positions_all = _gather_to_all(randoms_positions, mpicomm=mpicomm)
+    positions = [pos for pos in [data_positions_all, randoms_positions_all] if pos is not None]
+    attrs = get_mesh_attrs(*positions, **mesh_kwargs)
+
+    data = _make_particle_field(data_positions, data_weights, attrs=attrs, mpicomm=mpicomm)
+    randoms = None
+    if randoms_positions is not None:
+        randoms = _make_particle_field(randoms_positions, randoms_weights, attrs=attrs, mpicomm=mpicomm)
+    particles = FKPField(data, randoms, attrs=attrs) if randoms is not None else data
+    kwargs_recon = {
+        "resampler": recon_kwargs["resampler"],
+        "halo_add": recon_kwargs["halo_add"],
+        "smoothing_radius": smoothing_radius,
+        "threshold_randoms": recon_kwargs["threshold_randoms"],
+    }
+    if reconstruction_algorithm.__name__ in ["IterativeFFTReconstruction", "IterativeFFTParticleReconstruction"]:
+        kwargs_recon["niterations"] = recon_kwargs["niterations"]
+    reconstruction = reconstruction_algorithm(
+        particles,
+        growth_rate=f,
+        bias=bias,
+        los=recon_kwargs["los"],
+        **kwargs_recon,
+    )
+    return reconstruction, attrs, recon_kwargs
+
+
+def _paint_particles(positions, weights=None, attrs=None, resampler="cic", halo_add=0, mpicomm=None):
+    """Paint particle positions and optional weights onto a real mesh."""
+    particles = _make_particle_field(positions, weights=weights, attrs=attrs, mpicomm=mpicomm)
+    mesh = particles.paint(resampler=resampler, compensate=False, interlacing=0, halo_add=halo_add, out="real")
+    return mesh, particles
+
+
+def _get_threshold_randoms(randoms, threshold_randoms=0.01):
+    """Resolve a random-catalog density threshold for density-contrast meshes."""
+    if randoms is None or threshold_randoms is None:
+        return None
+    if isinstance(threshold_randoms, tuple):
+        threshold_method, threshold_value = threshold_randoms
+    else:
+        threshold_method, threshold_value = "noise", threshold_randoms
+    if threshold_method not in ["noise", "mean"]:
+        raise ValueError('threshold_randoms method must be "noise" or "mean".')
+    if threshold_method == "noise":
+        return threshold_value * (randoms.weights**2).sum() / randoms.sum()
+    return threshold_value * randoms.sum() / randoms.size
+
+
+def _density_contrast(mesh_data, mesh_randoms=None, randoms=None, bias=1.0, smoothing_radius=15.0, threshold_randoms=0.01):
+    """Estimate the bias-scaled density contrast used for PNG blinding."""
+    from jaxrecon.zeldovich import estimate_mesh_delta
+
+    threshold_randoms = _get_threshold_randoms(randoms, threshold_randoms=threshold_randoms)
+    return (
+        estimate_mesh_delta(
+            mesh_data,
+            mesh_randoms=mesh_randoms,
+            threshold_randoms=threshold_randoms,
+            smoothing_radius=smoothing_radius,
+        )
+        / bias
+    )
+
+
+def _apply_png_transfer(mesh, bfnl, tk):
+    """Apply PNG transfer function to a jaxpower complex mesh."""
+    import jax.numpy as jnp
+
+    k = sum(np.asarray(kk) ** 2 for kk in mesh.attrs.kcoords(sparse=True)) ** 0.5
+    transfer = np.zeros(k.shape, dtype=np.asarray(mesh.value).real.dtype)
+    nonzero = k != 0.0
+    transfer[nonzero] = bfnl / tk(k[nonzero])
+    return mesh * jnp.asarray(transfer)
+
+
+def _replace_mesh_zeros(mesh):
+    """Replace exact zero mesh cells by one to avoid division by zero."""
+    import jax.numpy as jnp
+
+    return mesh.clone(value=jnp.where(mesh.value == 0.0, 1.0, mesh.value))
+
+
+def _smooth_mesh(mesh, smoothing_radius=15.0):
+    """Return a Gaussian-smoothed copy of a jaxpower mesh."""
+    from jaxrecon.zeldovich import kernel_gaussian
+
+    return (mesh.r2c() * kernel_gaussian(mesh.attrs, smoothing_radius=smoothing_radius)).c2r()
+
+
+def _read_mesh(mesh, positions, resampler="cic", halo_add=0):
+    """Read a mesh field at particle positions as a NumPy array."""
+    return np.asarray(mesh.read(positions, resampler=resampler, compensate=False, halo_add=halo_add))
+
+
+def _gradient_shifts(mesh, positions, resampler="cic", halo_add=0):
+    """Read gradient displacements from a complex mesh at particle positions."""
+    import jax.numpy as jnp
+
+    kcoords = mesh.attrs.kcoords(sparse=True)
+    k2 = sum(kk**2 for kk in kcoords)
+    k2 = jnp.where(k2 == 0.0, 1.0, k2)
+    disps = []
+    for iaxis in range(mesh.attrs.ndim):
+        psi = (mesh * (1j * kcoords[iaxis] / k2)).c2r()
+        disps.append(_read_mesh(psi, positions, resampler=resampler, halo_add=halo_add))
+    return np.column_stack(disps)
+
+
+def _apply_rsd_jax_blinding(
+    data_positions,
+    data_weights=None,
+    randoms_positions=None,
+    randoms_weights=None,
+    cosmo_fid=None,
+    fgrowth_blind=None,
+    bias=None,
+    z=None,
+    recon="IterativeFFTReconstruction",
+    smoothing_radius=15.0,
+    dtype=None,
+    mpicomm=None,
+    **kwargs,
+):
+    """Apply RSD blinding using desiblind-owned jax-recon logic."""
+    data_positions = np.asarray(data_positions)
+    f_fid = _get_from_cosmo(cosmo_fid, "f", z=z)
+    reconstruction, attrs, recon_kwargs = _build_reconstruction(
+        data_positions,
+        data_weights=data_weights,
+        randoms_positions=randoms_positions,
+        randoms_weights=randoms_weights,
+        f=f_fid,
+        bias=bias,
+        smoothing_radius=smoothing_radius,
+        dtype=dtype,
+        mpicomm=mpicomm,
+        default_cellsize=7.0,
+        recon=recon,
+        **kwargs,
+    )
+    del attrs, recon_kwargs
+    shifts = np.asarray(reconstruction.read_shifts(data_positions, field="rsd"))
+    return data_positions + (float(fgrowth_blind) / f_fid - 1.0) * shifts
+
+
+def _apply_fnl_jax_blinding(
+    data_positions,
+    data_weights=None,
+    randoms_positions=None,
+    randoms_weights=None,
+    cosmo_fid=None,
+    fnl_blind=0.0,
+    bias=None,
+    z=None,
+    method="data_weights",
+    recon="IterativeFFTReconstruction",
+    smoothing_radius=30.0,
+    shotnoise_correction=False,
+    dtype=None,
+    mpicomm=None,
+    **kwargs,
+):
+    """Apply local-PNG/fNL blinding using desiblind-owned jax-recon logic."""
+    import mpytools as mpy
+
+    available_methods = ["data_weights", "randoms_weights", "data_positions", "randoms_positions"]
+    if method not in available_methods:
+        raise ValueError(f"blinding method {method} must be one of {available_methods}.")
+
+    data_positions = np.asarray(data_positions)
+    randoms_positions = None if randoms_positions is None else np.asarray(randoms_positions)
+    f_fid = _get_from_cosmo(cosmo_fid, "f", z=z)
+    reconstruction, attrs, recon_kwargs = _build_reconstruction(
+        data_positions,
+        data_weights=data_weights,
+        randoms_positions=randoms_positions,
+        randoms_weights=randoms_weights,
+        f=f_fid,
+        bias=bias,
+        smoothing_radius=smoothing_radius,
+        dtype=dtype,
+        mpicomm=mpicomm,
+        default_cellsize=15.0,
+        recon=recon,
+        **kwargs,
+    )
+    resampler, halo_add = recon_kwargs["resampler"], recon_kwargs["halo_add"]
+    threshold_randoms = recon_kwargs["threshold_randoms"]
+    sigma1 = smoothing_radius
+    shifts = np.asarray(reconstruction.read_shifts(data_positions, field="rsd"))
+    shifted_positions = data_positions - shifts
+    mesh_data, _ = _paint_particles(
+        shifted_positions,
+        weights=data_weights,
+        attrs=attrs,
+        resampler=resampler,
+        halo_add=halo_add,
+        mpicomm=mpicomm,
+    )
+    mesh_randoms, randoms = None, None
+    if randoms_positions is not None:
+        mesh_randoms, randoms = _paint_particles(
+            randoms_positions,
+            weights=randoms_weights,
+            attrs=attrs,
+            resampler=resampler,
+            halo_add=halo_add,
+            mpicomm=mpicomm,
+        )
+
+    if "weights" not in method and shotnoise_correction:
+        raise ValueError("No shot noise correction when blinding is based on particle shifts.")
+
+    mesh_delta = _density_contrast(
+        mesh_data,
+        mesh_randoms=mesh_randoms,
+        randoms=randoms,
+        bias=bias,
+        smoothing_radius=smoothing_radius,
+        threshold_randoms=threshold_randoms,
+    )
+    sigma2 = smoothing_radius
+    mesh = mesh_delta.r2c()
+    bfnl = 2.0 * 1.686 * (bias - 1.0) * float(fnl_blind)
+
+    pk_prim = cosmo_fid.get_primordial().pk_interpolator(mode="scalar")
+    pk_lin = cosmo_fid.get_fourier().pk_interpolator(of="theta_cb").to_1d(z=z)
+
+    def tk(k):
+        """Return the transfer factor connecting primordial and linear power."""
+        pphi_prim = 9.0 / 25.0 * 2.0 * np.pi**2 / k**3 * pk_prim(k) / cosmo_fid.h**3
+        return (pk_lin(k) / pphi_prim) ** 0.5
+
+    mesh = _apply_png_transfer(mesh, bfnl, tk)
+
+    if shotnoise_correction:
+
+        def s1(k):
+            """Return the first Gaussian smoothing kernel value."""
+            return np.exp(-0.5 * k**2 * sigma1**2)
+
+        def s2(k):
+            """Return the second Gaussian smoothing kernel value."""
+            return np.exp(-0.5 * k**2 * sigma2**2)
+
+        sum_w2, _ = _paint_particles(
+            data_positions,
+            weights=data_weights * data_weights if data_weights is not None else None,
+            attrs=attrs,
+            resampler=resampler,
+            halo_add=halo_add,
+            mpicomm=mpicomm,
+        )
+
+        sum_wd, _ = _paint_particles(
+            data_positions,
+            weights=data_weights,
+            attrs=attrs,
+            resampler=resampler,
+            halo_add=halo_add,
+            mpicomm=mpicomm,
+        )
+
+        if randoms_positions is not None:
+            mesh_nbar, _ = _paint_particles(
+                randoms_positions,
+                weights=randoms_weights,
+                attrs=attrs,
+                resampler=resampler,
+                halo_add=halo_add,
+                mpicomm=mpicomm,
+            )
+            alpha = mpy.csum(
+                data_weights if data_weights is not None else len(data_positions),
+                mpicomm=mpicomm,
+            ) / mpy.csum(
+                randoms_weights if randoms_weights is not None else len(randoms_positions),
+                mpicomm=mpicomm,
+            )
+            nbar = alpha / np.prod(np.asarray(attrs.cellsize)) * mesh_nbar
+        else:
+            nbar = mpy.csum(
+                data_weights if data_weights is not None else len(data_positions),
+                mpicomm=mpicomm,
+            ) / np.prod(np.asarray(attrs.boxsize))
+
+        sum_w2 = _replace_mesh_zeros(sum_w2)
+        inv_shotnoise = sum_wd * nbar / sum_w2
+        inv_shotnoise = _smooth_mesh(inv_shotnoise, smoothing_radius=smoothing_radius)
+
+        mu_pivot = 0.6
+        k_pivot = 4e-3 if bfnl >= 0.0 else 8e-3
+        if "data" in method:
+            shotnoise = 1.0 / _read_mesh(inv_shotnoise, data_positions, resampler=resampler, halo_add=halo_add)
+        elif "randoms" in method:
+            shotnoise = 1.0 / _read_mesh(inv_shotnoise, randoms_positions, resampler=resampler, halo_add=halo_add)
+        else:
+            shotnoise = 0.0
+
+        mask = s1(pk_lin.k) > 1e-4
+        sigma_d_2 = pk_lin.clone(k=pk_lin.k[mask], pk=(s1(pk_lin.k) ** 2 * pk_lin(pk_lin.k))[mask]).sigma_d() ** 2
+
+        x_tilde = (bias + f_fid * mu_pivot**2) * (bias + (1.0 - s1(k_pivot)) * f_fid * mu_pivot**2)
+        x_tilde *= s2(k_pivot) * pk_lin(k_pivot)
+        x_tilde += s2(k_pivot) * shotnoise * np.exp(-0.5 * k_pivot**2 * mu_pivot**2 * f_fid**2 * sigma_d_2)
+        y_tilde = (bias + (1.0 - s1(k_pivot)) * f_fid * mu_pivot**2) ** 2
+        y_tilde *= s2(k_pivot) ** 2 * pk_lin(k_pivot)
+        y_tilde += s2(k_pivot) ** 2 * shotnoise
+        expected_pivot = 2.0 * bfnl / tk(k_pivot) * bias * (bias + f_fid * mu_pivot**2) * pk_lin(k_pivot)
+        expected_pivot += (bfnl / tk(k_pivot)) ** 2 * bias**2 * pk_lin(k_pivot)
+
+        shotnoise_factor = (-x_tilde + np.sqrt(x_tilde**2 + y_tilde * expected_pivot)) / y_tilde / (bfnl / tk(k_pivot))
+    else:
+        shotnoise_factor = 1.0
+
+    if "weights" in method:
+        mesh = mesh.c2r()
+        if "data" in method:
+            weights = _read_mesh(mesh, data_positions, resampler=resampler, halo_add=halo_add)
+            weights = (1.0 if data_weights is None else data_weights) * (1.0 + shotnoise_factor * weights)
+        elif "randoms" in method:
+            weights = _read_mesh(mesh, randoms_positions, resampler=resampler, halo_add=halo_add)
+            weights = (1.0 if randoms_weights is None else randoms_weights) * (1.0 - shotnoise_factor * weights)
+        return weights
+
+    positions = data_positions if "data" in method else randoms_positions
+    shifts = _gradient_shifts(mesh, positions, resampler=resampler, halo_add=halo_add)
+    shifts -= mpy.cmean(shifts, mpicomm=mpicomm)
+    return positions + (shifts if "data" in method else -shifts)
+
+
 def _validate_candidate(
     candidate,
     modes=("bao", "rsd", "fnl"),
@@ -166,6 +630,7 @@ def _validate_candidate(
     max_df_fraction=DEFAULT_MAX_DF_FRACTION,
     fnl_limits=DEFAULT_FNL_LIMITS,
 ):
+    """Validate one sealed catalog-blinding candidate against safety limits."""
     modes = TracerCatalogBlinder.get_blinding_modes(modes)
     needs_w0wa = any(mode in modes for mode in ["bao", "rsd"])
     if needs_w0wa:
@@ -303,11 +768,13 @@ class TracerCatalogBlinder:
 
     @classmethod
     def _get_bid(cls):
+        """Return the deterministic blinded realization id used in production."""
         rng = np.random.RandomState(seed=42)
         return int(rng.randint(0, cls.blinded_nmax))
 
     @classmethod
     def get_parameters_fn(cls, save_dir=None, parameters_fn=None):
+        """Return the catalog-blinding parameter filename to load or write."""
         if parameters_fn is not None:
             return Path(parameters_fn)
         if save_dir is None:
@@ -316,6 +783,7 @@ class TracerCatalogBlinder:
 
     @classmethod
     def _find_legacy_parameters_fn(cls, save_dir=None):
+        """Return the first legacy parameter file present in ``save_dir``."""
         if save_dir is None:
             save_dir = SHIFTS_DIR
         save_dir = Path(save_dir)
@@ -327,6 +795,7 @@ class TracerCatalogBlinder:
 
     @classmethod
     def get_blinding_modes(cls, modes):
+        """Normalize user-facing catalog blinding mode names and aliases."""
         aliases = {"ap": "bao", "bao_ap": "bao", "png": "fnl", "local_png": "fnl"}
         normalized = []
         for mode in _make_tuple(modes):
@@ -339,6 +808,7 @@ class TracerCatalogBlinder:
 
     @classmethod
     def _load_secret_candidate(cls, save_dir=None, parameters_fn=None):
+        """Load the sealed parameter candidate selected by the hidden bid."""
         fn = cls.get_parameters_fn(save_dir=save_dir, parameters_fn=parameters_fn)
         if parameters_fn is None and not fn.exists():
             legacy_fn = cls._find_legacy_parameters_fn(save_dir=save_dir)
@@ -467,6 +937,7 @@ class TracerCatalogBlinder:
 
     @classmethod
     def output_version(cls, version, params_or_options):
+        """Return an output version string with the configured blind suffix."""
         if not params_or_options:
             return version
         modes = params_or_options.get("modes", ("bao",))
@@ -490,6 +961,7 @@ class TracerCatalogBlinder:
 
     @classmethod
     def output_version_from_options(cls, version, options):
+        """Return an output version string using an unresolved options dict."""
         if not options:
             return version
         options = dict(options)
@@ -500,6 +972,7 @@ class TracerCatalogBlinder:
 
     @classmethod
     def _copy_catalog_with_attrs(cls, catalog, **columns):
+        """Copy a catalog, preserve attrs, and replace selected columns."""
         new = catalog.copy()
         new.attrs.update(getattr(catalog, "attrs", {}))
         for name, value in columns.items():
@@ -508,6 +981,7 @@ class TracerCatalogBlinder:
 
     @classmethod
     def _with_attrs(cls, catalog, params):
+        """Attach catalog-blinding attrs to a catalog-like object in place."""
         attrs = cls.blinding_attrs(params)
         if attrs:
             catalog.attrs.update(attrs)
@@ -515,6 +989,7 @@ class TracerCatalogBlinder:
 
     @staticmethod
     def _get_fiducial_cosmology(cosmo_fid="DESI"):
+        """Return the fiducial cosmology object used by catalog blinding."""
         if isinstance(cosmo_fid, str):
             if cosmo_fid != "DESI":
                 raise ValueError(f"Unknown fiducial cosmology {cosmo_fid!r}; pass a cosmology object instead.")
@@ -548,6 +1023,7 @@ class TracerCatalogBlinder:
 
     @classmethod
     def _require_bao_parameters(cls, params):
+        """Return BAO params when active, validating required AP keys."""
         if not params:
             return None
         modes = params.get("modes", None)
@@ -569,6 +1045,7 @@ class TracerCatalogBlinder:
         copy=True,
         inverse=False,
     ):
+        """Apply the forward or inverse AP redshift transform to one catalog."""
         input_zcol = zcol if input_zcol is None else input_zcol
         output_zcol = zcol if output_zcol is None else output_zcol
         z_shift = cls.transform_redshift(catalog[input_zcol], w0=params["w0"], wa=params["wa"], inverse=inverse)
@@ -682,6 +1159,7 @@ class TracerCatalogBlinder:
 
     @staticmethod
     def _positions_to_rdz(positions):
+        """Convert Cartesian positions to RA, DEC, and DESI-fiducial redshift."""
         from cosmoprimo.fiducial import DESI
         from cosmoprimo.utils import DistanceToRedshift
         from mockfactory import cartesian_to_sky
@@ -697,32 +1175,29 @@ class TracerCatalogBlinder:
             return data
         from cosmoprimo.fiducial import DESI
         from mockfactory import Catalog
-        from mockfactory.blinding import CutskyCatalogBlinding
 
         options = params.get("options", {})
         stracer = _simple_tracer(tracer)
         zeff = options.get("zeff", LSS_DEFAULT_ZEFF[stracer])
         bias = options.get("bias", LSS_DEFAULT_BIAS[stracer])
 
-        cosmo_blind = DESI()
-        cosmo_blind._derived["f"] = params["fgrowth_blind"]
         crandoms = Catalog.concatenate(randoms)
-        blinding = CutskyCatalogBlinding(
-            cosmo_fid="DESI",
-            cosmo_blind=cosmo_blind,
-            bias=bias,
-            z=zeff,
-            position_type="pos",
-            mpicomm=data.mpicomm,
-        )
-        positions = blinding.rsd(
+        rsd_kwargs = dict(options.get("rsd_kwargs", {}))
+        recon = rsd_kwargs.pop("recon", options.get("rsd_recon", "IterativeFFTReconstruction"))
+        positions = _apply_rsd_jax_blinding(
             data["POSITION"],
             data_weights=data["INDWEIGHT"],
             randoms_positions=crandoms["POSITION"],
             randoms_weights=crandoms["INDWEIGHT"],
-            recon=options.get("rsd_recon", "IterativeFFTReconstruction"),
+            cosmo_fid=DESI(),
+            fgrowth_blind=params["fgrowth_blind"],
+            bias=bias,
+            z=zeff,
+            recon=recon,
             smoothing_radius=options.get("rsd_smoothing_radius", 15.0),
-            **options.get("rsd_kwargs", {}),
+            dtype=options.get("dtype", None),
+            mpicomm=getattr(data, "mpicomm", None),
+            **rsd_kwargs,
         )
         ra, dec, redshift = cls._positions_to_rdz(positions)
         new = cls._copy_catalog_with_attrs(data, POSITION=positions, RA=ra, DEC=dec, Z=redshift)
@@ -735,7 +1210,6 @@ class TracerCatalogBlinder:
             return data, randoms
         from cosmoprimo.fiducial import DESI
         from mockfactory import Catalog
-        from mockfactory.blinding import CutskyCatalogBlinding
 
         options = params.get("options", {})
         stracer = _simple_tracer(tracer)
@@ -747,26 +1221,25 @@ class TracerCatalogBlinder:
                 'Only fnl_method="data_weights" is currently validated for DESI catalog blinding.'
             )
 
-        cosmo_blind = DESI()
-        cosmo_blind._derived["fnl"] = params["fnl_blind"]
         crandoms = Catalog.concatenate(randoms)
-        blinding = CutskyCatalogBlinding(
-            cosmo_fid="DESI",
-            cosmo_blind=cosmo_blind,
-            bias=bias,
-            z=zeff,
-            position_type="pos",
-            mpicomm=data.mpicomm,
-        )
-        new_weights = blinding.png(
+        fnl_kwargs = dict(options.get("fnl_kwargs", {}))
+        recon = fnl_kwargs.pop("recon", options.get("fnl_recon", "IterativeFFTReconstruction"))
+        new_weights = _apply_fnl_jax_blinding(
             data["POSITION"],
             data_weights=data["INDWEIGHT"],
             randoms_positions=crandoms["POSITION"],
             randoms_weights=crandoms["INDWEIGHT"],
+            cosmo_fid=DESI(),
+            fnl_blind=params["fnl_blind"],
+            bias=bias,
+            z=zeff,
             method=method,
+            recon=recon,
             shotnoise_correction=options.get("fnl_shotnoise_correction", True),
             smoothing_radius=options.get("fnl_smoothing_radius", 30.0),
-            **options.get("fnl_kwargs", {}),
+            dtype=options.get("dtype", None),
+            mpicomm=getattr(data, "mpicomm", None),
+            **fnl_kwargs,
         )
         blind_weight = new_weights / data["INDWEIGHT"]
         new = cls._copy_catalog_with_attrs(data, INDWEIGHT=new_weights, WEIGHT_BLIND=blind_weight)
@@ -774,6 +1247,7 @@ class TracerCatalogBlinder:
 
 
 def _parse_rows(rows):
+    """Parse comma-separated and repeated CLI row selectors."""
     if rows is None:
         return None
     parsed = []
@@ -783,6 +1257,7 @@ def _parse_rows(rows):
 
 
 def collect_argparser():
+    """Build the command-line parser for catalog parameter generation."""
     parser = argparse.ArgumentParser(description="Generate DESI catalog-level blinding secret parameters.")
     parser.add_argument("--parameters-fn", default=None, help="Explicit .npy parameter filename; recommended for production.")
     parser.add_argument("--save-dir", default=None, help=f"Directory for the generic default {CATALOG_PARAMETERS_FILENAME}.")
@@ -807,6 +1282,7 @@ def collect_argparser():
 
 
 def main(args=None):
+    """CLI entry point for generating sealed catalog-blinding parameters."""
     parser = collect_argparser()
     ns = parser.parse_args(args=args)
     fn = generate_catalog_parameters(

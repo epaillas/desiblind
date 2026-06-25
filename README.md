@@ -12,6 +12,12 @@
 pip install -e /path/to/desiblind/
 ```
 
+For catalog-level RSD/fNL blinding, install the catalog extra:
+
+```bash
+pip install -e "/path/to/desiblind[catalog]"
+```
+
 The package depends on [`desilike`](https://github.com/cosmodesi/desilike). Install it first if it is not already present in your environment, or load the DESI `cosmodesi` environment at NERSC:
 
 ```bash
