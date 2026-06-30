@@ -29,9 +29,22 @@ source /global/common/software/desi/users/adematti/cosmodesi_environment.sh main
 ```
 
 
+## Catalog-level blinding modules
+
+Catalog-level blinding implementations are separated by physical effect:
+
+```text
+desiblind/catalog_bao.py   CatalogBAOBlinder
+desiblind/catalog_rsd.py   CatalogRSDBlinder
+desiblind/catalog_fnl.py   future CatalogFNLBlinder
+```
+
+The public imports remain available from the package top level, e.g.
+`from desiblind import CatalogBAOBlinder, CatalogRSDBlinder`.
+
 ## Catalog-level BAO/AP blinding
 
-`desiblind` also provides a generic BAO/AP catalog-level redshift remapping API.
+`desiblind` provides a generic BAO/AP catalog-level redshift remapping API.
 DESI pipeline code or validation drivers should still handle catalog file
 discovery, `LSScats/` naming, region splitting, and job orchestration; the
 catalog blinder only handles the generic redshift-remapping transformation and
@@ -131,14 +144,12 @@ scripts/validation/catalog_bao_validation.ipynb
 
 The rendered notebook uses BAO-range validation products for the plots: Pk with `meshsize=256`, `boxsize=6000`, `kmax=0.13`, `dk=0.005`, and xi with `smax=200`, `ds=5`, `nmu=40`. The Pk plot summary is `/pscratch/sd/u/uendert/desiblind_lss_validation/desi-clustering-pk-bao-validated-20260625T130130Z/summary.json`; the xi plot summary is `/pscratch/sd/u/uendert/desiblind_lss_validation/desi-clustering-xi-wide-20260625T114027Z/summary.json`.
 
-Remaining work before production use includes optional random resampling modes
-and any additional production packaging requested by the collaboration. The
-catalog-level blinding machinery and validation should stay in `desiblind`; a
-measurement pipeline such as `desi-clustering` should either read saved blinded
-catalogs as normal inputs or keep only a narrow measurement-side bridge to
-`CatalogBAOBlinder`. Future RSD and fNL catalog blinding should be treated as
-saved-catalog workflows, not generic on-the-fly measurement options, because
-they require reconstruction and heavier LSS processing.
+The catalog-level blinding machinery and validation should stay in `desiblind`;
+a measurement pipeline such as `desi-clustering` should read saved blinded
+catalogs as normal inputs or keep only a narrow measurement-side bridge. RSD
+catalog blinding is validated as a saved-catalog workflow because it requires
+reconstruction. Future fNL catalog blinding should follow the same ownership
+pattern rather than becoming a generic on-the-fly measurement option.
 
 ## Examples
 
