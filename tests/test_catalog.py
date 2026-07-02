@@ -1,11 +1,15 @@
 import hashlib
+import json
+import subprocess
+import sys
 import tempfile
+from pathlib import Path
 
 import numpy as np
 import pytest
 from mockfactory import Catalog
 
-from desiblind import CatalogBAOBlinder
+from desiblind import CatalogBAOBlinder, CatalogRSDBlinder
 
 
 PARAMS = {'w0': -0.95, 'wa': 0.10}
@@ -118,3 +122,172 @@ def test_catalog_bao_parameter_bank_rejects_legacy_unsuffixed_key():
         np.save(parameters_fn, {key: PARAMS})
         with pytest.raises(ValueError, match='legacy unsuffixed keys'):
             CatalogBAOBlinder.load_blinded_parameters('LRG3', parameters_fn=parameters_fn)
+
+
+def test_catalog_bao_alpha_shift_validation():
+    stats = CatalogBAOBlinder.validate_alpha_shift(PARAMS)
+    assert stats['max_abs_alpha_parallel_minus_one'] < 0.03
+    assert stats['max_abs_alpha_perp_minus_one'] < 0.03
+
+    with pytest.raises(ValueError, match='outside the allowed DESI 3% alpha-shift region'):
+        CatalogBAOBlinder.validate_alpha_shift({'w0': -0.90, 'wa': 0.26})
+
+    with pytest.raises(ValueError, match=r'w0 \+ wa'):
+        CatalogBAOBlinder.validate_alpha_shift({'w0': -0.20, 'wa': 0.30})
+
+
+
+def test_catalog_bao_generate_parameters():
+    parameters, metadata = CatalogBAOBlinder.generate_parameters(
+        seed=123,
+        w0_range=(-0.96, -0.94),
+        wa_range=(0.08, 0.12),
+        max_attempts=10,
+    )
+    assert metadata['parameter_source'] == 'desiblind_generated'
+    assert metadata['generator'] == 'uniform_rejection'
+    assert metadata['seed'] == 123
+    assert metadata['accepted_attempt'] >= 1
+    assert -0.96 <= parameters['w0'] <= -0.94
+    assert 0.08 <= parameters['wa'] <= 0.12
+    CatalogBAOBlinder.validate_alpha_shift(parameters)
+
+    with pytest.raises(ValueError, match='explicit seed'):
+        CatalogBAOBlinder.generate_parameters(seed=None)
+
+    with pytest.raises(RuntimeError, match='Could not generate valid'):
+        CatalogBAOBlinder.generate_parameters(
+            seed=123,
+            w0_range=(-0.20, -0.10),
+            wa_range=(0.30, 0.40),
+            max_attempts=3,
+        )
+
+def test_catalog_bao_lss_parameter_bank_loader(tmp_path):
+    bank_fn = tmp_path / 'w0wa.txt'
+    np.savetxt(bank_fn, np.array([[-0.95, 0.10], [-0.90, 0.03]]))
+    filerow = tmp_path / 'filerow.txt'
+    filerow.write_text('1\n')
+
+    loaded = CatalogBAOBlinder.load_lss_parameters(parameters_fn=bank_fn, index=0)
+    assert loaded['w0'] == -0.95
+    assert loaded['wa'] == 0.10
+    assert loaded['index'] == 0
+
+    loaded = CatalogBAOBlinder.load_lss_parameters(parameters_fn=bank_fn, filerow=filerow)
+    assert loaded['w0'] == -0.90
+    assert loaded['wa'] == 0.03
+    assert loaded['index'] == 1
+
+    with pytest.raises(ValueError, match='exactly one'):
+        CatalogBAOBlinder.load_lss_parameters(parameters_fn=bank_fn)
+
+
+def test_catalog_bao_load_parameters_sources(tmp_path):
+    bank_fn = tmp_path / 'catalog_bank.npy'
+    CatalogBAOBlinder.write_blinded_parameters('LRG1', PARAMS, parameters_fn=bank_fn)
+
+    parameters, metadata = CatalogBAOBlinder.load_parameters(
+        name='LRG1', parameters_fn=bank_fn, source='desiblind', bid=CatalogBAOBlinder._get_bid()
+    )
+    assert parameters == PARAMS
+    assert metadata['parameter_source'] == 'desiblind'
+    assert metadata['name'] == 'LRG1'
+
+    lss_bank_fn = tmp_path / 'w0wa.txt'
+    np.savetxt(lss_bank_fn, np.array([[-0.95, 0.10]]))
+    parameters, metadata = CatalogBAOBlinder.load_parameters(
+        source='lss', lss_parameters_fn=lss_bank_fn, lss_parameter_index=0
+    )
+    assert parameters == PARAMS
+    assert metadata['parameter_source'] == 'lss'
+    assert metadata['index'] == 0
+
+    parameters, metadata = CatalogBAOBlinder.load_parameters(parameters=PARAMS)
+    assert parameters == PARAMS
+    assert metadata['parameter_source'] == 'explicit'
+
+
+
+def test_create_catalog_w0wa_blinding_bank_script(tmp_path):
+    script = Path(__file__).resolve().parents[1] / 'scripts' / 'create_catalog_w0wa_blinding_bank.py'
+    bank_fn = tmp_path / 'catalog_blinding_parameters.npy'
+    record_fn = tmp_path / 'private_record.json'
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            '--output', str(bank_fn),
+            '--bid', '7',
+            '--w0', '-0.95',
+            '--wa', '0.10',
+            '--tracer-bins', 'LRG1', 'ELG1',
+            '--record-fn', str(record_fn),
+        ],
+        check=True,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+
+    assert bank_fn.exists()
+    assert record_fn.exists()
+    assert CatalogBAOBlinder.load_blinded_parameters('LRG1', parameters_fn=bank_fn, bid=7) == PARAMS
+    assert CatalogBAOBlinder.load_blinded_parameters('ELG1', parameters_fn=bank_fn, bid=7) == PARAMS
+    record = json.loads(record_fn.read_text())
+    assert record['bid'] == 7
+    assert record['parameters'] == PARAMS
+    assert record['source']['parameter_source'] == 'explicit'
+    assert record['effects'] == ['bao']
+    assert record['outputs']['bao'] == str(bank_fn)
+
+    generated_bank_fn = tmp_path / 'generated_catalog_bao_blinding_parameters.npy'
+    generated_rsd_bank_fn = tmp_path / 'generated_catalog_rsd_blinding_parameters.npy'
+    generated_record_fn = tmp_path / 'generated_private_record.json'
+    subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            '--effects', 'bao', 'rsd',
+            '--bao-output', str(generated_bank_fn),
+            '--rsd-output', str(generated_rsd_bank_fn),
+            '--bid', '8',
+            '--generate',
+            '--seed', '123',
+            '--w0-range=-0.96,-0.94',
+            '--wa-range=0.08,0.12',
+            '--tracer-bins', 'LRG1',
+            '--rsd-bin', 'LRG1:0.8:2.0',
+            '--record-fn', str(generated_record_fn),
+        ],
+        check=True,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    generated_record = json.loads(generated_record_fn.read_text())
+    assert generated_record['effects'] == ['bao', 'rsd']
+    assert generated_record['source']['parameter_source'] == 'desiblind_generated'
+    assert generated_record['source']['seed'] == 123
+    generated_params = generated_record['parameters']
+    assert CatalogBAOBlinder.load_blinded_parameters('LRG1', parameters_fn=generated_bank_fn, bid=8) == generated_params
+    CatalogBAOBlinder.validate_alpha_shift(generated_params)
+    rsd_params = CatalogRSDBlinder.load_blinded_parameters('LRG1', parameters_fn=generated_rsd_bank_fn, bid=8)
+    assert rsd_params['w0'] == generated_params['w0']
+    assert rsd_params['wa'] == generated_params['wa']
+    assert rsd_params['zeff'] == 0.8
+    assert rsd_params['bias'] == 2.0
+    assert rsd_params['fgrowth_blind'] == generated_record['rsd']['tracer_bins'][0]['parameters']['fgrowth_blind']
+
+    dry_run_fn = tmp_path / 'dryrun.npy'
+    subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            '--output', str(dry_run_fn),
+            '--bid', '7',
+            '--w0', '-0.95',
+            '--wa', '0.10',
+            '--dry-run',
+        ],
+        check=True,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert not dry_run_fn.exists()

@@ -74,6 +74,60 @@ CatalogBAOBlinder.write_blinded_parameters('LRG3', params, save_dir='private')
 params = CatalogBAOBlinder.load_blinded_parameters('LRG3', save_dir='private')
 ```
 
+For closed catalog-level `w0`/`wa` blinding, create private hashed banks with a
+native desiblind random draw:
+
+```bash
+python scripts/create_catalog_w0wa_blinding_bank.py \
+  --output /private/path/catalog_bao_blinding_parameters.npy \
+  --bid 42 \
+  --generate --seed 12345
+```
+
+The generator draws from configurable uniform `w0`/`wa` ranges, rejects points
+with `w0 + wa > 0`, validates the DESI 3 percent BAO/AP alpha-shift mask, and
+then writes the accepted point under private hashed keys. The historical LSS
+`w0wa` file is not used in this native path.
+
+The same hidden `w0`/`wa` pair can seed both BAO/AP and RSD banks. RSD derives
+`fgrowth_blind` from `w0`, `wa`, `zeff`, and `bias` for each tracer bin:
+
+```bash
+python scripts/create_catalog_w0wa_blinding_bank.py \
+  --effects bao rsd \
+  --bao-output /private/path/catalog_bao_blinding_parameters.npy \
+  --rsd-output /private/path/catalog_rsd_blinding_parameters.npy \
+  --bid 42 \
+  --generate --seed 12345 \
+  --rsd-bin LRG1:0.50:2.0 \
+  --rsd-bin LRG2:0.70:2.0 \
+  --record-fn /private/path/catalog_w0wa_blinding_record.json
+```
+
+For DR1/Y1 compatibility checks, the same helper can still seed the private bank
+from a historical LSS row index:
+
+```bash
+python scripts/create_catalog_w0wa_blinding_bank.py \
+  --output /private/path/catalog_bao_blinding_parameters.npy \
+  --bid 42 \
+  --lss-index 281
+```
+
+or, using the historical LSS `filerow.txt` convention:
+
+```bash
+python scripts/create_catalog_w0wa_blinding_bank.py \
+  --output /private/path/catalog_bao_blinding_parameters.npy \
+  --bid 42 \
+  --lss-filerow /global/cfs/cdirs/desi/survey/catalogs/Y1/LSS/iron/LSScats/filerow.txt
+```
+
+By default, the helper writes a BAO/AP bank for the standard tracer bins
+(`BGS1`, `LRG1`, `LRG2`, `LRG3`, `ELG1`, `ELG2`, `QSO1`). Use `--record-fn` only
+for a private unblinding record, because that JSON contains the raw parameters,
+seed/provenance, validation metadata, and any derived RSD values.
+
 Validation is organized by LSS workflow step, because LSS is the
 reference implementation for catalog-level blinding:
 
